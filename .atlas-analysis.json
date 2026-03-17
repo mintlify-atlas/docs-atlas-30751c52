@@ -1,0 +1,76 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "NVIDIA Video Classification",
+  "projectDescription": "An end-to-end deep learning system for multi-class video classification using a two-stage CNN + Bi-LSTM + Multi-Head Attention architecture, achieving ~93-95% accuracy on animation, gaming, natural, and flat content categories.",
+  "theme": "palm",
+  "primaryColor": "#76B900",
+  "lightColor": "#A8D500",
+  "darkColor": "#4A7A00",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture-overview",
+              "concepts/dataset",
+              "concepts/model-design"
+            ]
+          },
+          {
+            "group": "Training Guide",
+            "pages": [
+              "training/data-preprocessing",
+              "training/feature-extraction",
+              "training/model-training",
+              "training/evaluation"
+            ]
+          },
+          {
+            "group": "Inference & Deployment",
+            "pages": [
+              "inference/single-video",
+              "inference/ensemble-tta",
+              "inference/flask-app"
+            ]
+          },
+          {
+            "group": "Model Cards",
+            "pages": [
+              "models/temporal-model",
+              "models/ensemble-results"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Two-stage CNN + Bi-LSTM + Multi-Head Attention architecture for spatial-temporal video understanding",
+    "Multi-scale feature extraction using ResNet-50/101 and EfficientNet-V2-S/M backbones",
+    "4-model ensemble with Test-Time Augmentation (TTA) achieving ~95% classification accuracy",
+    "Four video content categories: Animation, Gaming, Natural Content, and Flat Content",
+    "Flask-based web application for real-time single-video inference",
+    "Trained on NVIDIA A100 GPU (MIG partition) with 251 GB RAM",
+    "Focal Loss with Label Smoothing and AdamW optimizer with Cosine Annealing",
+    "Pre-extracted HDF5 feature storage for fast inference without re-running CNN"
+  ],
+  "publicApiSurface": [
+    "GET /api/videos — list available dataset videos by category",
+    "POST /api/classify — classify a dataset video with optional TTA and per-model breakdown",
+    "EnhancedFeatureExtractor — extract multi-scale CNN features from video splits",
+    "SuperEnhancedTemporalModel — 4-layer BiLSTM + 12-head self-attention temporal classifier",
+    "SingleVideoClassifier — load ensemble checkpoints and predict on a single video",
+    "SingleVideoFeatureLoader — load pre-extracted features from HDF5 for a named video",
+    "SingleVideoClassifier.predict_standard() — ensemble inference without augmentation",
+    "SingleVideoClassifier.predict_with_tta() — inference with 4-mode Test-Time Augmentation",
+    "EnhancedTemporalModelTrainer — training loop with validation, checkpointing, and visualization",
+    "FocalLoss — focal loss with label smoothing for imbalanced classification"
+  ]
+}
