@@ -1,0 +1,167 @@
+---
+title: "Dataset"
+description: "YouTube-8M derived dataset with four video content categories."
+---
+
+The training data is derived from [YouTube-8M](https://research.google.com/youtube8m/), a large-scale labeled video dataset maintained by Google Research. Approximately 4,000 videos were selected and organized into four main content categories.
+
+## Categories
+
+<CardGroup cols={2}>
+  <Card title="Animation" icon="wand-magic-sparkles">
+    Animated content including cartoons, CGI films, and motion graphics. Label index: `0`.
+  </Card>
+  <Card title="Flat Content" icon="rectangle">
+    Static or near-static content such as slides, screencasts, and talking-head videos. Label index: `1`.
+  </Card>
+  <Card title="Gaming" icon="gamepad">
+    Video game footage and esports recordings. Label index: `2`.
+  </Card>
+  <Card title="Natural Content" icon="tree">
+    Real-world footage including nature, sports, and live events. Label index: `3`.
+  </Card>
+</CardGroup>
+
+The four categories map to integer labels as follows (from `configuration_analysis.json`):
+
+```json
+{
+  "Animation": 0,
+  "Flat_Content": 1,
+  "Gaming": 2,
+  "Natural_Content": 3
+}
+```
+
+## Structure and scale
+
+| Attribute | Value |
+|---|---|
+| Total videos | ~4,000 |
+| Main categories | 4 |
+| Subcategories | 46 |
+| Frames per video | 64 |
+| Frame resolution | 256 × 256 pixels |
+| Processing mode | GPU-accelerated |
+
+The 46 subcategories are distributed across the four main classes. Each subcategory occupies its own directory under the main class folder, with preprocessed tensors stored as `.pt` files.
+
+## Directory structure
+
+```
+data/
+├── train/
+│   ├── Animation/
+│   │   ├── subcategory_1/
+│   │   │   └── processed_data.pt
+│   │   └── subcategory_2/
+│   │       └── processed_data.pt
+│   ├── Flat_Content/
+│   ├── Gaming/
+│   └── Natural_Content/
+├── val/
+│   └── ... (same structure)
+└── test/
+    └── ... (same structure)
+```
+
+Each `processed_data.pt` file contains a video tensor with shape `[T, C, H, W]` where:
+- `T` — number of frames (64)
+- `C` — color channels (3, RGB)
+- `H`, `W` — height and width (256, 256)
+
+If a `.pt` file contains multiple videos, the tensor shape is `[B, T, C, H, W]`.
+
+## Train / val / test split
+
+```
+70% ──────────────────────────── Train
+20% ────────────── Validation
+10% ──────── Test
+```
+
+| Split | Approximate size | Use |
+|---|---|---|
+| Train | ~2,800 videos | Gradient updates |
+| Validation | ~800 videos | Hyperparameter tuning and early stopping |
+| Test | ~400 videos | Final evaluation only |
+
+The test split contains 412 videos according to the extracted feature file.
+
+## Class imbalance handling
+
+The four categories are not equally represented in the dataset. To prevent the model from learning a bias toward majority classes, training uses `WeightedRandomSampler`:
+
+```python
+from torch.utils.data import WeightedRandomSampler
+
+# Per-class weights inversely proportional to frequency
+weight = total_samples / (num_classes * class_count)
+weight = min(max(weight, 0.5), 10.0)  # clipped to [0.5, 10]
+
+sample_weights = [class_weights[label] for label in labels]
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(train_dataset),
+    replacement=True
+)
+```
+
+Each training batch is drawn so that all four classes appear with roughly equal frequency, regardless of their raw counts in the dataset.
+
+<Note>
+  Class weights are also passed to the `FocalLoss` criterion as the `alpha` parameter, providing a second layer of class balancing during the loss computation.
+</Note>
+
+## Feature file format
+
+After Stage 1 (CNN feature extraction), videos are stored as HDF5 files rather than raw tensors. This reduces the data volume by roughly 200× and allows fast random access during training.
+
+**File:** `test_features_multiscale.h5`
+
+| Dataset key | Shape | dtype | Description |
+|---|---|---|---|
+| `features` | `[412, 73, 1280]` | float32 | Per-frame CNN features, zero-padded to max length |
+| `labels` | `[412]` | int64 | Integer class labels |
+| `num_frames` | `[412]` | int32 | Actual (unpadded) frame count per video |
+
+File-level attributes stored alongside the datasets:
+
+| Attribute | Value |
+|---|---|
+| `num_videos` | 412 |
+| `max_frames` | 73 |
+| `feature_dim` | 1280 |
+| `category_mapping` | JSON string of label→index map |
+| `multi_scale` | `true` |
+
+<Info>
+  The `max_frames` dimension (73) is larger than `frames_per_video` (64) because multi-scale extraction at 1.15× produces up to `ceil(64 × 1.15) = 74` frames for some videos. Features are zero-padded to the maximum observed length within each split.
+</Info>
+
+The `num_frames` array is used at training time to pack sequences before passing them to the LSTM, ensuring padding tokens do not influence the hidden state:
+
+```python
+x = nn.utils.rnn.pack_padded_sequence(
+    x, lengths.cpu(), batch_first=True, enforce_sorted=False
+)
+lstm_out, _ = self.lstm(x)
+lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+```
+
+## Preprocessing pipeline
+
+<Steps>
+  <Step title="Frame extraction">
+    Each video is decoded and uniformly sampled to exactly 64 frames. Frames are resized to 256 × 256 pixels using GPU-accelerated processing.
+  </Step>
+  <Step title="Tensor serialization">
+    The frame stack is saved as a PyTorch `.pt` file with shape `[T, C, H, W]` (or `[B, T, C, H, W]` for batched files).
+  </Step>
+  <Step title="CNN feature extraction">
+    The `EnhancedFeatureExtractor` reads `.pt` files, runs each frame through the frozen CNN backbone at three temporal scales (0.85×, 1.0×, 1.15×), and averages the multi-scale features.
+  </Step>
+  <Step title="HDF5 storage">
+    Per-video features are zero-padded to the split's maximum frame count and written to a compressed HDF5 file (`gzip`, level 4). One file is produced per split: `train_features_multiscale.h5`, `val_features_multiscale.h5`, `test_features_multiscale.h5`.
+  </Step>
+</Steps>

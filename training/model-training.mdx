@@ -1,0 +1,361 @@
+---
+title: "Model training"
+description: "Training the temporal model with ensemble strategy."
+---
+
+Stage 2 of the pipeline trains a `SuperEnhancedTemporalModel` on the HDF5 feature files produced in Stage 1. The `EnhancedTemporalModelTrainer` class handles dataloader construction, training loop execution, checkpointing, resource monitoring, and ensemble coordination.
+
+## `EnhancedTemporalModelTrainer`
+
+### Constructor
+
+```python
+trainer = EnhancedTemporalModelTrainer(
+    features_dir="/features_enhanced",
+    output_dir="/models_enhanced",
+    device="cuda",
+)
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `features_dir` | Directory containing `train/val/test_features_multiscale.h5` |
+| `output_dir` | Where checkpoints and result JSON files are written |
+| `device` | `'cuda'` or `'cpu'` — falls back to CPU automatically |
+
+### History tracking
+
+The trainer maintains a `history` dict that is updated after every epoch and embedded into checkpoint files:
+
+```python
+self.history = {
+    'train_loss':       [],   # float per epoch
+    'train_acc':        [],   # % per epoch
+    'train_f1':         [],   # weighted F1 % per epoch
+    'val_loss':         [],
+    'val_acc':          [],
+    'val_f1':           [],
+    'val_per_class_f1': [],   # list[list[float]] — F1 per class per epoch
+    'learning_rates':   [],
+}
+```
+
+## `create_dataloaders()`
+
+```python
+train_loader, val_loader, test_loader = trainer.create_dataloaders(
+    batch_size=48,
+    num_workers=4,
+    feature_file_suffix='_multiscale',
+)
+```
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `batch_size` | 48 | Safe for 9.8 GB GPU with hidden_dim=768 |
+| `num_workers` | 4 | Test loader uses `num_workers // 2` |
+| Training sampler | `WeightedRandomSampler` | Inverse-frequency sampling, replacement=True |
+| `collate_fn` | `collate_features` | Pads variable-length sequences to batch max |
+| `pin_memory` | `True` | Faster host-to-device transfers |
+| `persistent_workers` | `True` | Train and val loaders keep worker processes alive |
+
+The `WeightedRandomSampler` uses per-class weights computed by `EnhancedPreExtractedFeaturesDataset._compute_class_weights()` (clipped to [0.5, 10.0]) to ensure under-represented classes appear at a comparable frequency to large classes.
+
+## Model architecture — `SuperEnhancedTemporalModel`
+
+```python
+model = SuperEnhancedTemporalModel(
+    feature_dim=2048,         # or 1280 for EfficientNet-V2
+    hidden_dim=768,
+    num_classes=4,
+    num_lstm_layers=4,
+    num_attention_heads=12,
+    dropout=0.4,
+    bidirectional=True,
+)
+```
+
+The forward pass:
+1. **Input projection** — linear → LayerNorm → ReLU → Dropout(0.2) → `[B, T, 768]`
+2. **4-layer BiLSTM** — with packed sequences; output `[B, T, 1536]`
+3. **Multi-head self-attention** (12 heads) with residual connection + LayerNorm
+4. **Attention pooling** — weighted sum over time: `[B, 1536]`
+5. **Classifier** — four linear layers (1536 → 768 → 512 → 256 → 4) with LayerNorm, ReLU, Dropout
+
+GPU error recovery is built into the LSTM forward pass — if a `CUDA` or `NVML_SUCCESS` runtime error occurs, the extractor clears the cache, synchronizes, sleeps 1 second, and retries once before re-raising:
+
+```python
+try:
+    lstm_out, _ = self.lstm(x)
+except RuntimeError as e:
+    if "NVML_SUCCESS" in str(e) or "CUDA" in str(e):
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        time.sleep(1)
+        lstm_out, _ = self.lstm(x)   # retry once
+    else:
+        raise
+```
+
+## Training hyperparameters
+
+| Hyperparameter | Value |
+|----------------|-------|
+| Learning rate | 0.001 |
+| Batch size | 48 |
+| Max epochs | 150 |
+| Early stopping patience | 25 epochs |
+| Gradient clipping | max norm = 1.0 |
+| Weight decay | 5 × 10⁻⁴ |
+| Optimizer betas | (0.9, 0.999) |
+
+## Optimizer
+
+**AdamW** with weight decay:
+
+```python
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=1e-3,
+    weight_decay=5e-4,
+    betas=(0.9, 0.999),
+)
+```
+
+## Scheduler
+
+**CosineAnnealingWarmRestarts** — restarts the cosine schedule every `T_0=20` epochs, doubling the period on each restart (`T_mult=2`). The learning rate oscillates between 0.001 and a minimum of 1 × 10⁻⁶:
+
+```python
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer,
+    T_0=20,
+    T_mult=2,
+    eta_min=1e-6,
+)
+```
+
+The scheduler steps **per batch** (not per epoch), so the warmup restarts align with training iterations rather than epochs.
+
+## Loss function — `FocalLoss`
+
+The loss combines focal weighting, per-class alpha balancing, and label smoothing to address both class imbalance and over-confidence:
+
+```python
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, smoothing=0.1):
+        ...
+
+    def forward(self, inputs, targets):
+        num_classes = inputs.shape[1]
+
+        # Label smoothing
+        confidence     = 1.0 - self.smoothing          # 0.9
+        smooth_targets = torch.zeros_like(inputs)
+        smooth_targets.fill_(self.smoothing / (num_classes - 1))
+        smooth_targets.scatter_(1, targets.unsqueeze(1), confidence)
+
+        # Focal weighting
+        log_probs = F.log_softmax(inputs, dim=1)
+        ce_loss   = -(smooth_targets * log_probs).sum(dim=1)
+        pt        = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        # Alpha (class weight) scaling
+        if self.alpha is not None:
+            at         = self.alpha.gather(0, targets)
+            focal_loss = at * focal_loss
+
+        return focal_loss.mean()
+```
+
+| Parameter | Value | Effect |
+|-----------|-------|--------|
+| `alpha` | Per-class weights tensor | Down-weights easy/frequent classes |
+| `gamma` | 2.0 | Standard focal exponent — hard examples contribute more |
+| `smoothing` | 0.1 | Distributes 10% of probability mass uniformly across classes |
+
+`alpha` is the `class_weights` tensor from `EnhancedPreExtractedFeaturesDataset`, computed as inverse class frequency and clipped to [0.5, 10.0].
+
+## Training loop
+
+```python
+for epoch in range(start_epoch, num_epochs):
+    # --- Train ---
+    model.train()
+    for features, labels, lengths in train_loader:
+        features, labels, lengths = (
+            features.to(device), labels.to(device), lengths.to(device)
+        )
+        optimizer.zero_grad()
+        outputs = model(features, lengths)
+        loss    = criterion(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()                 # per-batch step
+
+    # --- Validate ---
+    val_loss, val_metrics = trainer.validate(model, val_loader, criterion)
+
+    # --- Checkpointing ---
+    # Combined score: val_acc + val_f1 + worst_class_f1 (implicit via accuracy check)
+    if val_metrics['accuracy'] > best_val_acc:
+        best_val_acc = val_metrics['accuracy']
+        torch.save({...}, output_dir / f'best_{model_name}.pt')
+        patience_counter = 0
+    else:
+        patience_counter += 1
+
+    # Periodic checkpoint every 20 epochs (keeps last 3)
+    if epoch % 20 == 0 and epoch > 0:
+        torch.save({...}, f'{model_name}_checkpoint_epoch_{epoch}.pt')
+
+    # Early stopping
+    if patience_counter >= 25:
+        break
+```
+
+The **best model** is selected purely on validation accuracy. The `worst_class_f1` is tracked in history and logged per epoch for diagnostic purposes.
+
+## Ensemble training
+
+`train_ensemble()` trains `N` independent `SuperEnhancedTemporalModel` instances, each with a distinct random seed, and aggregates their softmax outputs by averaging:
+
+```python
+models, results = trainer.train_ensemble(
+    num_models=5,    # 3 or 5 recommended
+    num_epochs=150,
+    batch_size=48,
+    learning_rate=1e-3,
+    feature_file_suffix='_multiscale',
+)
+```
+
+Seeds are assigned as `42 + i` for model `i` (seeds 42, 43, 44, …). After all models finish, the ensemble predicts by:
+
+```python
+# Collect softmax probabilities from each model
+all_predictions  = [model_i_probs, ...]           # list of [N_test, 4] tensors
+ensemble_probs   = torch.stack(all_predictions).mean(dim=0)
+ensemble_metrics = trainer.compute_metrics(ensemble_probs, labels)
+```
+
+<Note>
+If any single model exhausts early stopping patience before 150 epochs, the ensemble continues automatically to the next model rather than halting. The `training_stopped_early` flag in the results JSON identifies which models stopped early.
+</Note>
+
+### Ensemble size guide
+
+| Option | Models | Expected accuracy | Training time |
+|--------|--------|-------------------|---------------|
+| Single + TTA | 1 | 93–95% | ~12 hours |
+| 3-model ensemble | 3 | 95–96% | ~30 hours |
+| 5-model ensemble | 5 | 96–97% | ~50 hours |
+
+## Checkpointing and resume
+
+Every `best_{model_name}.pt` and `{model_name}_checkpoint_epoch_{N}.pt` file contains the full training state:
+
+```python
+torch.save({
+    'epoch':                  epoch,
+    'model_state_dict':       model.state_dict(),
+    'optimizer_state_dict':   optimizer.state_dict(),
+    'metrics':                val_metrics,
+    'train_metrics':          train_metrics,
+    'history':                model_history,
+    'best_val_acc':           best_val_acc,
+    'best_epoch':             best_epoch,
+    'patience_counter':       patience_counter,
+    'model_config':           {...},
+    'training_config':        {...},
+}, checkpoint_path)
+```
+
+On the next run, the script automatically detects checkpoint files in `output_dir` and prompts for resume. Periodic checkpoints are capped at the last 3 to manage disk space.
+
+To resume programmatically:
+
+```python
+trainer.train_single_model(
+    num_epochs=150,
+    model_name='ensemble_model_0',
+    resume_from=Path('/models/ensemble_model_0_checkpoint_epoch_60.pt'),
+)
+```
+
+## `ResourceMonitor`
+
+A daemon thread logs GPU allocation, RAM usage, and CPU utilization every 30 minutes to `results/resource_utilization_log.json`:
+
+```python
+resource_monitor = ResourceMonitor(results_dir, interval_minutes=30)
+resource_monitor.start_monitoring()
+
+# ... training ...
+
+resource_monitor.stop_monitoring()
+summary = resource_monitor.get_summary()
+```
+
+Log entry format:
+
+```json
+{
+  "timestamp": "2025-10-27T14:30:00",
+  "cpu_percent": 45.2,
+  "ram_used_gb": 128.5,
+  "ram_total_gb": 251.0,
+  "ram_percent": 51.2,
+  "gpu_allocated_gb": 7.2,
+  "gpu_reserved_gb": 7.8,
+  "gpu_max_allocated_gb": 8.1
+}
+```
+
+## `RealTimeTrainingVisualizer`
+
+After every epoch, a 20 × 12 inch PNG is saved to `results/training_progress/` showing:
+
+- Train/val loss curves with best-epoch annotation
+- Train/val accuracy curves with 95% target line
+- Weighted F1 score progression
+- Current vs. best metrics summary panel
+- Learning rate schedule (log scale)
+- Per-class F1 bar chart for the current epoch
+
+Individual epoch PNGs are also stored under `results/training_progress/epoch_plots/epoch_NNN.png`, and can be assembled into an animated GIF with `visualizer.create_summary_gif()` if Pillow is installed.
+
+## `compute_metrics()`
+
+```python
+def compute_metrics(self, outputs, labels):
+    _, predicted = outputs.max(1)
+    accuracy     = 100. * predicted.eq(labels).sum().item() / labels.size(0)
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels.cpu().numpy(),
+        predicted.cpu().numpy(),
+        labels=list(range(self.num_classes)),
+        average=None,
+        zero_division=0,
+    )
+    avg_f1 = f1_score(labels.cpu().numpy(), predicted.cpu().numpy(),
+                      average='weighted', zero_division=0)
+
+    return {
+        'accuracy':    accuracy,
+        'f1_weighted': avg_f1 * 100,
+        'f1_per_class': f1 * 100,    # array of length num_classes
+    }
+```
+
+<CardGroup cols={2}>
+  <Card title="Feature extraction" href="/training/feature-extraction">
+    Produce the HDF5 files consumed by the trainer.
+  </Card>
+  <Card title="Evaluation" href="/training/evaluation">
+    Evaluate trained checkpoints with full metrics, confusion matrices, and ROC curves.
+  </Card>
+</CardGroup>

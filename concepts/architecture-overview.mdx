@@ -1,0 +1,205 @@
+---
+title: "Architecture overview"
+description: "How the two-stage spatial-temporal pipeline works."
+---
+
+Video classification is fundamentally harder than image classification. A single frame tells you *what* is in a scene, but understanding *Gaming* versus *Natural Content* requires perceiving motion, timing, and how frames relate to each other over time. To address this, the system uses a two-stage pipeline that separates spatial understanding from temporal modeling.
+
+<CardGroup cols={2}>
+  <Card title="Stage 1: Spatial" icon="image">
+    A pretrained CNN extracts per-frame semantic features offline, producing a compact representation of what each frame contains.
+  </Card>
+  <Card title="Stage 2: Temporal" icon="chart-line">
+    A BiLSTM + attention model reads the sequence of frame features to classify the video based on how content changes over time.
+  </Card>
+</CardGroup>
+
+## Why spatial + temporal?
+
+Image classifiers apply a single forward pass to one frame and output a class. That works when the category is determined by appearance alone. Video categories like Gaming or Animation are defined as much by motion patterns, frame rhythm, and temporal texture as by any single frame's content.
+
+The two-stage design buys two concrete advantages:
+
+1. **Efficiency.** CNN inference over 64 frames per video is expensive. By running the CNN once offline and storing the resulting features, the temporal model trains and runs inference on compact feature sequences rather than raw pixels.
+2. **Specialization.** The CNN backbone is frozen and used only for perception. The temporal model learns purely about sequence dynamics, with no gradient signal mixing spatial and temporal objectives.
+
+## Pipeline diagram
+
+```
+Raw video (.pt tensor)
+  [B, T, C, H, W]  ← T=64 frames, 256×256 pixels
+        │
+        ▼
+┌─────────────────────────────────────┐
+│  STAGE 1 — CNN Feature Extraction   │
+│  (offline, runs once per video)     │
+│                                     │
+│  Backbone: ResNet-50/101            │
+│         or EfficientNet-V2-S/M      │
+│                                     │
+│  Multi-scale sampling:              │
+│    scale 0.85x → frame features     │
+│    scale 1.00x → frame features     │
+│    scale 1.15x → frame features     │
+│         └──── averaged ────┘        │
+│                                     │
+│  Output: [T, 1280] per video        │
+└──────────────┬──────────────────────┘
+               │  saved to HDF5
+               │  test_features_multiscale.h5
+               │  shape: [412, 73, 1280]
+               ▼
+┌─────────────────────────────────────┐
+│  STAGE 2 — Temporal Modeling        │
+│  (online, trained end-to-end)       │
+│                                     │
+│  Input projection                   │
+│    Linear(1280 → 768)               │
+│    + LayerNorm + ReLU + Dropout     │
+│                                     │
+│  4-layer Bidirectional LSTM         │
+│    hidden_dim=768, output=1536      │
+│                                     │
+│  12-head Multi-Head Self-Attention  │
+│    + residual + LayerNorm           │
+│                                     │
+│  Attention pooling                  │
+│    learned weights → weighted sum   │
+│                                     │
+│  3-layer MLP classifier             │
+│    1536 → 768 → 512 → 256 → 4      │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+    class logits [B, 4]
+    Animation / Flat_Content
+    Gaming / Natural_Content
+```
+
+## Stage 1: CNN feature extraction
+
+The `EnhancedFeatureExtractor` loads a pretrained CNN, removes its classification head, and uses the penultimate layer as a feature extractor. Four backbones are supported:
+
+<Tabs>
+  <Tab title="ResNet-101 (default)">
+    ```python
+    self.cnn = models.resnet101(weights='IMAGENET1K_V2')
+    self.feature_dim = self.cnn.fc.in_features   # 2048
+    self.cnn.fc = nn.Identity()
+    ```
+    ResNet-101 is the default backbone. Its deeper residual connections provide richer semantic features than ResNet-50.
+  </Tab>
+  <Tab title="ResNet-50">
+    ```python
+    self.cnn = models.resnet50(weights='IMAGENET1K_V2')
+    self.feature_dim = self.cnn.fc.in_features   # 2048
+    self.cnn.fc = nn.Identity()
+    ```
+  </Tab>
+  <Tab title="EfficientNet-V2-S">
+    ```python
+    self.cnn = models.efficientnet_v2_s(weights='IMAGENET1K_V1')
+    self.feature_dim = self.cnn.classifier[1].in_features   # 1280
+    self.cnn.classifier = nn.Identity()
+    ```
+    EfficientNet-V2-S is the recommended backbone according to the configuration analysis. It produces 1280-dim features used in all production checkpoints.
+  </Tab>
+  <Tab title="EfficientNet-V2-M">
+    ```python
+    self.cnn = models.efficientnet_v2_m(weights='IMAGENET1K_V1')
+    self.feature_dim = self.cnn.classifier[1].in_features   # 1280
+    self.cnn.classifier = nn.Identity()
+    ```
+  </Tab>
+</Tabs>
+
+All CNN parameters are frozen during feature extraction:
+
+```python
+for param in self.cnn.parameters():
+    param.requires_grad = False
+```
+
+### Multi-scale extraction
+
+Rather than extracting features at a single frame rate, the extractor samples each video at three temporal scales and averages the resulting feature sequences:
+
+```python
+scales = [1.0, 0.85, 1.15]
+scale_features = []
+
+for scale in scales:
+    if scale != 1.0:
+        new_length = max(int(num_frames * scale), 5)
+        indices = np.linspace(0, num_frames - 1, new_length).astype(int)
+        scaled_video = video[indices]
+    else:
+        scaled_video = video
+    # ... extract features ...
+    scale_features.append(scale_feat)
+
+# Average across scales
+video_features = torch.stack(padded_scales).mean(dim=0)
+```
+
+<Note>
+  The 0.85× scale subsamples frames (faster motion), the 1.15× scale upsamples (slower motion). Averaging the three gives the model exposure to multiple effective playback speeds during training.
+</Note>
+
+Extracted features are stored in compressed HDF5 files with shape `[num_videos, max_frames, feature_dim]`. For the test split this is `[412, 73, 1280]`.
+
+## Stage 2: Temporal modeling
+
+The `SuperEnhancedTemporalModel` reads the sequence of per-frame CNN features and produces a class prediction. See [Model design](/concepts/model-design) for the full architecture breakdown.
+
+<Steps>
+  <Step title="Input projection">
+    A linear layer maps each frame feature from `feature_dim` (1280) down to `hidden_dim` (768), followed by LayerNorm, ReLU, and Dropout. This standardizes the input before the recurrent layers.
+  </Step>
+  <Step title="Bidirectional LSTM">
+    Four stacked BiLSTM layers process the projected frame sequence. Each layer reads the sequence both forward and backward, and its output has dimension `768 × 2 = 1536` (concatenated forward + backward states).
+  </Step>
+  <Step title="Multi-head self-attention">
+    A 12-head MultiheadAttention layer lets every frame attend to every other frame. A residual connection and LayerNorm are applied around this sub-layer.
+  </Step>
+  <Step title="Attention pooling">
+    A small MLP learns a scalar importance weight for each frame. The weights are normalized via Softmax and used to compute a weighted sum of the attended sequence, collapsing `[B, T, 1536]` to `[B, 1536]`.
+  </Step>
+  <Step title="MLP classifier">
+    A 3-layer fully connected head with LayerNorm, ReLU, and Dropout at each layer maps the pooled representation to 4 class logits.
+  </Step>
+</Steps>
+
+## Ensemble strategy
+
+Four models are trained independently using the same hyperparameters. At inference time their softmax probabilities are averaged before taking the argmax:
+
+```python
+# Conceptual ensemble inference
+all_probs = []
+for model in ensemble_models:
+    logits = model(features, lengths)
+    probs = F.softmax(logits, dim=1)
+    all_probs.append(probs)
+
+ensemble_probs = torch.stack(all_probs).mean(dim=0)
+prediction = ensemble_probs.argmax(dim=1)
+```
+
+The four checkpoints (`best_ensemble_model_1.pt` through `best_ensemble_model_4.pt`) achieved individual validation accuracies of 72.7%, 92.1%, 91.9%, and 91.9%. Ensemble averaging smooths out the weaker model's errors and pushes combined accuracy above 93%.
+
+<Tip>
+  Test-Time Augmentation (TTA) can push accuracy further to ~95% by running inference four times per video with different temporal augmentations (original, reversed, 2× speed, 0.67× speed) and averaging the predictions.
+</Tip>
+
+## Pre-extraction approach
+
+The CNN runs entirely offline before training begins. This design choice has three benefits:
+
+| Consideration | Impact |
+|---|---|
+| Training speed | The temporal model trains on compact `[T, 1280]` tensors rather than raw `[T, 3, 256, 256]` frames — roughly 200× smaller per sample |
+| GPU memory | The CNN (frozen) never consumes memory during temporal model training |
+| Iteration speed | Hyperparameter sweeps and ensemble training require only Stage 2 reruns |
+
+The tradeoff is that end-to-end fine-tuning of the CNN backbone is not possible without re-running the feature extraction step.

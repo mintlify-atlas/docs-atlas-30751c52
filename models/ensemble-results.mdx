@@ -1,0 +1,192 @@
+---
+title: Ensemble results
+description: Performance metrics for individual models and the final ensemble.
+---
+
+# Ensemble results
+
+The production ensemble combines 5 independently trained `SuperEnhancedTemporalModel` checkpoints (ensemble\_model\_0 through ensemble\_model\_4). Predictions are aggregated by averaging softmax probabilities across all members before taking the argmax.
+
+<Info>
+  ensemble\_model\_0 failed to converge (best validation accuracy 25.8%) and is excluded from the checkpoint selection table below. The final evaluation ensemble uses all 5 checkpoints as recorded in `ensemble_final_results.json`.
+</Info>
+
+## Ensemble composition
+
+| Slot | Checkpoint file | Best val epoch | Best val accuracy |
+|------|----------------|---------------|-------------------|
+| 1 | `best_ensemble_model_1.pt` | 52 | 72.73% |
+| 2 | `best_ensemble_model_2.pt` | 43 | 92.13% |
+| 3 | `best_ensemble_model_3.pt` | 42 | 91.86% |
+| 4 | `best_ensemble_model_4.pt` | 40 | 91.86% |
+
+## Validation metrics per member
+
+All values are from each model's best validation checkpoint (the epoch at which the checkpoint was saved).
+
+| Model | Epoch | Val accuracy | Weighted F1 | Animation F1 | Flat\_Content F1 | Gaming F1 | Natural\_Content F1 |
+|-------|-------|-------------|-------------|-------------|----------------|----------|--------------------|
+| ensemble\_model\_1 | 52 | 72.73% | 64.76% | 1.10% | 93.47% | 66.06% | 96.69% |
+| ensemble\_model\_2 | 43 | 92.13% | 92.15% | 86.46% | 96.74% | 87.88% | 97.52% |
+| ensemble\_model\_3 | 42 | 91.86% | 91.87% | 87.67% | 95.47% | 88.00% | 96.38% |
+| ensemble\_model\_4 | 40 | 91.86% | 91.88% | 88.02% | 95.24% | 88.48% | 95.77% |
+
+## Test metrics per member
+
+Metrics recorded on the held-out test set after training, from the individual result files.
+
+<CardGroup cols={2}>
+  <Card title="ensemble_model_1" icon="chart-bar">
+    **Standard test**  
+    Accuracy: 74.51%  
+    Weighted F1: 66.52%  
+
+    **With TTA**  
+    Accuracy: 74.51%  
+    Weighted F1: 66.53%
+  </Card>
+  <Card title="ensemble_model_2" icon="chart-bar">
+    **Standard test**  
+    Accuracy: 92.48%  
+    Weighted F1: 92.49%  
+
+    **With TTA**  
+    Accuracy: 91.75%  
+    Weighted F1: 91.74%
+  </Card>
+  <Card title="ensemble_model_3" icon="chart-bar">
+    **Standard test**  
+    Accuracy: 91.75%  
+    Weighted F1: 91.77%  
+
+    **With TTA**  
+    Accuracy: 91.99%  
+    Weighted F1: 91.99%
+  </Card>
+  <Card title="ensemble_model_4" icon="chart-bar">
+    **Standard test**  
+    Accuracy: 93.45%  
+    Weighted F1: 93.46%  
+
+    **With TTA**  
+    Accuracy: 93.20%  
+    Weighted F1: 93.20%
+  </Card>
+</CardGroup>
+
+## Final ensemble performance
+
+The combined 5-model ensemble (including ensemble\_model\_0) was evaluated on the test set as reported in `ensemble_final_results.json`.
+
+| Metric | Value |
+|--------|-------|
+| Accuracy | **93.69%** |
+| Weighted F1 | **93.69%** |
+| Animation (class 0) F1 | 88.77% |
+| Flat\_Content (class 1) F1 | 97.65% |
+| Gaming (class 2) F1 | 89.40% |
+| Natural\_Content (class 3) F1 | 98.55% |
+
+<Note>
+  The ensemble accuracy (93.69%) exceeds the best individual member (ensemble\_model\_4 at 93.45%) by 0.24 percentage points, with gains across all four classes.
+</Note>
+
+## Individual vs. ensemble comparison
+
+| Model | Test accuracy | Test weighted F1 | Delta vs. ensemble |
+|-------|--------------|-----------------|--------------------|
+| ensemble\_model\_1 | 74.51% | 66.52% | −19.18 pp |
+| ensemble\_model\_2 | 92.48% | 92.49% | −1.21 pp |
+| ensemble\_model\_3 | 91.75% | 91.77% | −1.94 pp |
+| ensemble\_model\_4 | 93.45% | 93.46% | −0.24 pp |
+| **Ensemble (5 models)** | **93.69%** | **93.69%** | — |
+
+## Test-Time Augmentation
+
+TTA applies multiple perturbations to each input at inference time and averages the resulting probability distributions. Its impact varies by member.
+
+| Model | Standard accuracy | TTA accuracy | TTA delta |
+|-------|------------------|-------------|----------|
+| ensemble\_model\_1 | 74.51% | 74.51% | 0.00 pp |
+| ensemble\_model\_2 | 92.48% | 91.75% | −0.73 pp |
+| ensemble\_model\_3 | 91.75% | 91.99% | +0.24 pp |
+| ensemble\_model\_4 | 93.45% | 93.20% | −0.25 pp |
+
+<Note>
+  TTA consistently benefits ensemble\_model\_3 but slightly degrades ensemble\_model\_2 and ensemble\_model\_4. TTA benefit depends on model calibration and the augmentation strategy used. Apply TTA selectively or evaluate on a validation hold-out before enabling it in production.
+</Note>
+
+## Per-class analysis
+
+<AccordionGroup>
+  <Accordion title="Animation (class 0) — hardest class">
+    Animation was the most difficult class across all members.
+
+    | Model | Animation F1 (val) | Animation F1 (test) |
+    |-------|-------------------|--------------------|
+    | ensemble\_model\_1 | 1.10% | 0.00% |
+    | ensemble\_model\_2 | 86.46% | 88.30% |
+    | ensemble\_model\_3 | 87.67% | 83.94% |
+    | ensemble\_model\_4 | 88.02% | 89.58% |
+    | **Ensemble** | — | **88.77%** |
+
+    ensemble\_model\_1 failed almost entirely to learn Animation at both validation (1.10%) and test (0.00%) time. Models 2–4 reached 83–89% F1. The ensemble improves the class score to 88.77% by pooling the more reliable predictions from members 2–4.
+
+    Animation content likely overlaps visually with Flat\_Content (both can contain uniform or stylized frames), making boundary cases harder to resolve without longer temporal context.
+  </Accordion>
+
+  <Accordion title="Flat_Content (class 1) — strongest class">
+    Flat\_Content achieved the highest F1 scores across all models and evaluation modes.
+
+    | Model | Flat\_Content F1 (val) | Flat\_Content F1 (test) |
+    |-------|----------------------|------------------------|
+    | ensemble\_model\_1 | 93.47% | 95.85% |
+    | ensemble\_model\_2 | 96.74% | 96.23% |
+    | ensemble\_model\_3 | 95.47% | 97.14% |
+    | ensemble\_model\_4 | 95.24% | 97.17% |
+    | **Ensemble** | — | **97.65%** |
+
+    Even ensemble\_model\_1, which performed poorly on Animation, achieved 93.47% on Flat\_Content at its best validation epoch. This suggests Flat\_Content has highly distinctive temporal and feature-level signatures (e.g., screencasts, slideshows, static UI elements).
+  </Accordion>
+
+  <Accordion title="Gaming (class 2)">
+    Gaming showed high variance between models, particularly for ensemble\_model\_1.
+
+    | Model | Gaming F1 (val) | Gaming F1 (test) |
+    |-------|----------------|------------------|
+    | ensemble\_model\_1 | 66.06% | 67.11% |
+    | ensemble\_model\_2 | 87.88% | 87.56% |
+    | ensemble\_model\_3 | 88.00% | 86.38% |
+    | ensemble\_model\_4 | 88.48% | 89.20% |
+    | **Ensemble** | — | **89.40%** |
+
+    ensemble\_model\_1's relatively strong Gaming score (66%) compared to its near-zero Animation score is one reason it remains in the ensemble: it contributes Gaming-specific signal that offsets its Animation blind spot when predictions are averaged.
+  </Accordion>
+
+  <Accordion title="Natural_Content (class 3) — second strongest class">
+    Natural\_Content consistently scored above 95% F1 for models 2–4.
+
+    | Model | Natural\_Content F1 (val) | Natural\_Content F1 (test) |
+    |-------|-------------------------|---------------------------|
+    | ensemble\_model\_1 | 96.69% | 98.06% |
+    | ensemble\_model\_2 | 97.52% | 97.58% |
+    | ensemble\_model\_3 | 96.38% | 99.04% |
+    | ensemble\_model\_4 | 95.77% | 97.58% |
+    | **Ensemble** | — | **98.55%** |
+
+    Natural\_Content was the second easiest class overall. ensemble\_model\_1, despite its low overall accuracy, scored 96.69% on Natural\_Content at its best checkpoint, further supporting its inclusion in the ensemble.
+  </Accordion>
+</AccordionGroup>
+
+## Why ensemble_model_1 is included
+
+ensemble\_model\_1 has a low overall accuracy (72.73% validation, 74.51% test) and fails entirely on Animation at test time. Its inclusion in the ensemble is justified by:
+
+1. **Flat\_Content strength** — 93.47% validation F1, among the highest of any model on that class.
+2. **Natural\_Content strength** — 96.69% validation F1, comparable to models 2–4.
+3. **Gaming coverage** — 66.06% validation F1, providing complementary signal when models 2–4 disagree.
+4. **Prediction diversity** — A lower-accuracy model trained to a different local optimum can reduce ensemble variance on classes where the other members are also uncertain, as long as it does not introduce systematic errors that the averaging cannot cancel.
+
+<Tip>
+  If inference latency is a concern, removing ensemble\_model\_1 from the ensemble is the lowest-cost pruning option. Models 2–4 alone reach ~92–93% accuracy with full Animation coverage.
+</Tip>

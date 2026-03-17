@@ -1,0 +1,200 @@
+---
+title: Temporal model card
+description: Architecture specifications, hyperparameters, and design details for SuperEnhancedTemporalModel.
+---
+
+# Temporal model card
+
+**Model name:** SuperEnhancedTemporalModel  
+**Model type:** Temporal sequence classifier (BiLSTM + MultiheadAttention)  
+**Task:** 4-class video content classification (Animation, Flat\_Content, Gaming, Natural\_Content)
+
+<Info>
+  SuperEnhancedTemporalModel was designed to exceed 95% accuracy by combining deep bidirectional LSTM sequence encoding with multi-head self-attention and learned attention pooling over variable-length feature sequences.
+</Info>
+
+## Architecture overview
+
+The model processes per-frame EfficientNet-V2-S feature vectors extracted at 1280 dimensions, projects them into a shared latent space, encodes temporal relationships with a 4-layer BiLSTM, refines representations with multi-head self-attention, and produces class logits through a deep 4-layer classifier.
+
+```
+Input [B, T, 1280]
+  └─ Input projection  →  [B, T, 768]
+  └─ BiLSTM (4 layers) →  [B, T, 1536]
+  └─ MultiheadAttention (+ residual + LN) → [B, T, 1536]
+  └─ Attention pooling → [B, 1536]
+  └─ Classifier        → [B, 4]
+```
+
+## Layer-by-layer breakdown
+
+### Input projection
+
+Projects raw backbone features into the model's hidden dimension.
+
+| Layer | Parameters |
+|-------|------------|
+| `Linear` | 1280 → 768 |
+| `LayerNorm` | 768 |
+| `ReLU` | — |
+| `Dropout` | p = 0.2 (dropout × 0.5) |
+
+### BiLSTM encoder
+
+| Parameter | Value |
+|-----------|-------|
+| `input_size` | 768 |
+| `hidden_size` | 768 |
+| `num_layers` | 4 |
+| `bidirectional` | True |
+| `dropout` (inter-layer) | 0.4 |
+| Output dimension | 1536 (768 × 2) |
+
+Sequences are packed with `pack_padded_sequence` using the `lengths` tensor to skip padded frames, then unpacked after the LSTM pass.
+
+### Multi-head self-attention
+
+Applied over the full BiLSTM output sequence with a residual connection and layer normalization.
+
+| Parameter | Value |
+|-----------|-------|
+| `embed_dim` | 1536 |
+| `num_heads` | 12 |
+| `dropout` | 0.4 |
+| `batch_first` | True |
+| Residual | `attended = LN(lstm_out + dropout(attended))` |
+
+### Attention pooling
+
+Learned soft-attention pooling compresses the sequence dimension to a single vector.
+
+| Layer | Parameters |
+|-------|------------|
+| `Linear` | 1536 → 768 |
+| `LayerNorm` | 768 |
+| `Tanh` | — |
+| `Dropout` | p = 0.2 (dropout × 0.5) |
+| `Linear` | 768 → 1 (scalar weight per timestep) |
+
+Softmax is applied over the time dimension; the output is the weighted sum of attended vectors.
+
+### Classifier head
+
+Four linear blocks with progressively decreasing width.
+
+| Layer | Parameters |
+|-------|------------|
+| `Linear` | 1536 → 768 |
+| `LayerNorm` + `ReLU` + `Dropout(0.4)` | — |
+| `Linear` | 768 → 512 |
+| `LayerNorm` + `ReLU` + `Dropout(0.4)` | — |
+| `Linear` | 512 → 256 |
+| `LayerNorm` + `ReLU` + `Dropout(0.2)` | — |
+| `Linear` | 256 → 4 |
+
+## Hyperparameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `feature_dim` | 1280 | Input feature dimension from EfficientNet-V2-S |
+| `hidden_dim` | 768 | LSTM hidden size and projection target |
+| `num_classes` | 4 | Output classes |
+| `num_lstm_layers` | 4 | LSTM depth |
+| `num_attention_heads` | 12 | Number of self-attention heads |
+| `dropout` | 0.4 | Base dropout rate |
+| `bidirectional` | True | BiLSTM enabled |
+
+## Training configuration
+
+| Setting | Value |
+|---------|-------|
+| Learning rate | 0.001 |
+| Batch size | 48 |
+| Max epochs | 150 |
+| Early stop patience | 25 epochs |
+| Optimizer | AdamW |
+| Scheduler | CosineAnnealingWarmRestarts |
+
+### Loss function
+
+`FocalLoss(gamma=2.0, smoothing=0.1)` with per-class weights.
+
+- **Label smoothing** distributes `0.1` of the probability mass across non-target classes: `confidence = 0.9`, `smooth_fill = 0.1 / (num_classes − 1)`.
+- **Focal modulation** downweights easy examples: `loss = (1 − p_t)^2 × CE`.
+- **Class weights** are gathered per sample via `alpha.gather(0, targets)` to address class imbalance.
+
+## Inputs and outputs
+
+| Tensor | Shape | Description |
+|--------|-------|-------------|
+| `x` | `[B, T, 1280]` | Per-frame feature tensor, B = batch, T = sequence length |
+| `lengths` | `[B]` | Actual frame count per sample for sequence packing |
+| Output logits | `[B, 4]` | Unnormalized class scores |
+
+<Note>
+  The model accepts variable-length sequences through PyTorch's `pack_padded_sequence` / `pad_packed_sequence` API. Pass `lengths` to avoid attending to padded frames.
+</Note>
+
+## Weight initialization
+
+| Module | Initialization |
+|--------|---------------|
+| `nn.Linear` | Xavier uniform (`nn.init.xavier_uniform_`), bias = 0 |
+| `nn.LayerNorm` | weight = 1, bias = 0 (`nn.init.constant_`) |
+
+## CUDA error recovery
+
+The LSTM forward pass wraps the call in a try/except block that catches `RuntimeError` containing `"NVML_SUCCESS"` or `"CUDA"` strings. On detection:
+
+1. `torch.cuda.empty_cache()` frees cached memory.
+2. `torch.cuda.synchronize()` flushes pending CUDA operations.
+3. A 1-second sleep allows the GPU to stabilize.
+4. The LSTM call is retried once. If the retry fails, the error is re-raised.
+
+<Warning>
+  The recovery path is triggered only for known GPU/NVML errors. Other `RuntimeError` exceptions propagate immediately without retry.
+</Warning>
+
+## Hardware
+
+| Resource | Specification |
+|----------|---------------|
+| GPU | NVIDIA A100 MIG 9.8 GB |
+| RAM | 251 GB |
+
+## Code example
+
+```python
+import torch
+from model_train_new import SuperEnhancedTemporalModel
+
+# Instantiate model
+model = SuperEnhancedTemporalModel(
+    feature_dim=1280,
+    hidden_dim=768,
+    num_classes=4,
+    num_lstm_layers=4,
+    num_attention_heads=12,
+    dropout=0.4,
+    bidirectional=True,
+)
+model = model.cuda()
+
+# Example forward pass
+batch_size = 8
+max_frames = 73
+
+features = torch.randn(batch_size, max_frames, 1280).cuda()  # [B, T, 1280]
+lengths = torch.tensor([73, 60, 55, 70, 73, 45, 68, 73])    # actual frame counts
+
+logits = model(features, lengths)  # [B, 4]
+probs = torch.softmax(logits, dim=-1)
+predictions = logits.argmax(dim=-1)
+
+print(f"Logits shape: {logits.shape}")       # torch.Size([8, 4])
+print(f"Predictions:  {predictions.tolist()}")
+```
+
+<Tip>
+  For inference on a single checkpoint, load the state dict with `torch.load("best_ensemble_model_N.pt")` and set the model to `model.eval()` before calling `forward`. Wrap in `torch.no_grad()` to skip gradient tracking.
+</Tip>

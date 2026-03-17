@@ -1,0 +1,309 @@
+---
+title: "Evaluation"
+description: "Evaluating model performance with metrics, confusion matrices, and ROC curves."
+---
+
+This page covers how trained checkpoints are evaluated using `comprehensive_model_evaluation.py`, the per-model results captured in `configuration_analysis.json`, ensemble gains, test-set accuracy with and without Test-Time Augmentation (TTA), and the full suite of classification diagnostics including confusion matrices and per-class ROC curves.
+
+## Evaluation pipeline overview
+
+`comprehensive_model_evaluation.py` provides:
+
+- **`MultiscaleH5Dataset`** — loads pre-extracted HDF5 feature files into memory
+- **`collate_features`** — pads variable-length sequences per batch
+- **`SuperEnhancedTemporalModel`** — re-instantiated from checkpoint weights for inference
+- Computation of accuracy, per-class precision/recall/F1, confusion matrix, and one-vs-rest ROC curves
+
+## `MultiscaleH5Dataset`
+
+```python
+from src.utils.comprehensive_model_evaluation import MultiscaleH5Dataset
+
+dataset = MultiscaleH5Dataset(
+    h5_path="/features/val_features_multiscale.h5",
+    split="val",
+)
+```
+
+The dataset reads the entire feature array into CPU memory on construction (not lazy-loaded), which gives fast random access during evaluation:
+
+```python
+with h5py.File(self.h5_path, 'r') as f:
+    self.features = f['features'][:]   # [N, T, D] — fully in RAM
+    self.labels   = f['labels'][:]
+```
+
+If the HDF5 file contains a `video_names` or `video_paths` dataset, those are loaded as human-readable identifiers; otherwise synthetic names `video_0`, `video_1`, … are assigned.
+
+`__getitem__` returns `(features_tensor, int_label)`. The `collate_features` function in this module is equivalent to the one used during training — it pads sequences to the batch maximum and returns `(padded_features, labels, lengths)`.
+
+## Metrics computed
+
+`EnhancedTemporalModelTrainer.compute_metrics()` is the single source of truth for all metric values reported throughout training and evaluation:
+
+```python
+def compute_metrics(self, outputs, labels):
+    _, predicted = outputs.max(1)
+
+    accuracy = 100. * predicted.eq(labels).sum().item() / labels.size(0)
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels.cpu().numpy(),
+        predicted.cpu().numpy(),
+        labels=list(range(self.num_classes)),
+        average=None,       # per-class values
+        zero_division=0,
+    )
+    avg_f1 = f1_score(
+        labels.cpu().numpy(), predicted.cpu().numpy(),
+        average='weighted', zero_division=0,
+    )
+
+    return {
+        'accuracy':    accuracy,         # overall %
+        'f1_weighted': avg_f1 * 100,     # sample-weighted F1 %
+        'f1_per_class': f1 * 100,        # array[num_classes]
+    }
+```
+
+| Metric | Description |
+|--------|-------------|
+| Accuracy | % of test samples correctly classified |
+| Weighted F1 | F1 score weighted by class support |
+| Per-class F1 | Separate F1 for Animation, Flat_Content, Gaming, Natural_Content |
+| Per-class precision | `sklearn` `precision_recall_fscore_support` with `average=None` |
+| Per-class recall | Same as above |
+
+## Per-checkpoint results
+
+The four ensemble checkpoints were evaluated against the test split (`test_features_multiscale.h5`, 412 videos). Results are stored in `configuration_analysis.json`.
+
+<Note>
+The category mapping is `{"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}`. Per-class F1 values in the table below follow this order.
+</Note>
+
+### Individual model performance
+
+| Model | Stopped at epoch | Val accuracy | Val F1 (weighted) |
+|-------|-----------------|-------------|-------------------|
+| `best_ensemble_model_1.pt` | 52 | 72.7% | 64.8% |
+| `best_ensemble_model_2.pt` | 43 | 92.1% | 92.1% |
+| `best_ensemble_model_3.pt` | 42 | 91.9% | 91.9% |
+| `best_ensemble_model_4.pt` | 40 | 91.9% | 91.9% |
+
+### Per-class F1 scores
+
+| Model | Animation (0) | Flat Content (1) | Gaming (2) | Natural Content (3) |
+|-------|--------------|-----------------|-----------|---------------------|
+| Model 1 | 1.1% | 93.5% | 66.1% | 96.7% |
+| Model 2 | 86.5% | 96.7% | 87.9% | 97.5% |
+| Model 3 | 87.7% | 95.5% | 88.0% | 96.4% |
+| Model 4 | 88.0% | 95.2% | 88.5% | 95.8% |
+
+<Warning>
+Model 1 achieved only **1.1% F1 on the Animation class** despite a 72.7% overall accuracy. This is a classic case of high-accuracy predictions driven by majority classes masking failure on a minority class. Model 1 is included in the ensemble specifically to benefit from diversity — its predictions for Flat Content (93.5%) and Natural Content (96.7%) still contribute positive signal.
+</Warning>
+
+### Model config (all checkpoints)
+
+All four checkpoints share identical architecture and training hyperparameters:
+
+| Parameter | Value |
+|-----------|-------|
+| `feature_dim` | 1280 (EfficientNet-V2-S) |
+| `hidden_dim` | 768 |
+| `num_lstm_layers` | 4 |
+| `num_attention_heads` | 12 |
+| `dropout` | 0.4 |
+| `bidirectional` | True |
+| `learning_rate` | 0.001 |
+| `batch_size` | 48 |
+| `num_epochs` | 150 |
+| `patience` | 25 |
+
+## Ensemble results
+
+The four individual models are combined by averaging their softmax probability vectors:
+
+```python
+ensemble_probs   = torch.stack(all_model_probs).mean(dim=0)  # [N_test, 4]
+ensemble_metrics = trainer.compute_metrics(ensemble_probs, labels)
+```
+
+Ensemble averaging reduces variance introduced by different random seeds and training runs. Models 2, 3, and 4 each achieve ~91.9–92.1% accuracy individually; combining them with Model 1 (which provides diversity despite lower overall accuracy) yields a measurable improvement over any single model.
+
+## Test accuracy
+
+| Evaluation mode | Accuracy |
+|----------------|---------|
+| Standard (single forward pass) | ~93% |
+| With TTA | ~95% |
+
+TTA runs four inference passes per video with different temporal transformations and averages the softmax outputs:
+
+| TTA mode | Transformation |
+|----------|---------------|
+| `None` (original) | No modification |
+| `'reverse'` | Frame order reversed |
+| `'speed_up'` | Sub-sampled to ~50% of frames |
+| `'speed_down'` | Up-sampled to ~150% of frames |
+
+```python
+tta_modes        = [None, 'reverse', 'speed_up', 'speed_down']
+all_predictions  = []
+
+for tta_mode in tta_modes:
+    tta_dataset = EnhancedPreExtractedFeaturesDataset(
+        feature_file, augment=False, tta_mode=tta_mode
+    )
+    tta_loader  = DataLoader(tta_dataset, ...)
+
+    mode_preds  = []
+    with torch.no_grad():
+        for features, labels, lengths in tta_loader:
+            outputs = model(features.to(device), lengths.to(device))
+            mode_preds.append(F.softmax(outputs, dim=1).cpu())
+
+    all_predictions.append(torch.cat(mode_preds))
+
+avg_predictions = torch.stack(all_predictions).mean(dim=0)
+```
+
+<Tip>
+TTA adds ~4× inference time. For production latency budgets, omit TTA and rely on the ensemble alone — the ensemble already captures much of the same variance reduction.
+</Tip>
+
+## Confusion matrix
+
+`comprehensive_model_evaluation.py` generates a confusion matrix using scikit-learn and visualizes it as a seaborn heatmap:
+
+```python
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+
+cm = confusion_matrix(true_labels, predicted_labels)
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt='d',
+    xticklabels=class_names,
+    yticklabels=class_names,
+    cmap='Blues',
+)
+```
+
+The confusion matrix is saved to the results directory alongside a normalized version (values as fractions of each true-class total) to show relative error rates independently of class size.
+
+## ROC curves
+
+Multi-class ROC curves use a **one-vs-rest** strategy. For each class `i`, samples of that class form the positive set and all other samples form the negative set. The AUC is computed per class and aggregated as a macro average:
+
+```python
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import roc_curve, auc
+
+# Binarize labels: shape [N, num_classes]
+y_bin = label_binarize(true_labels, classes=range(num_classes))
+
+for i in range(num_classes):
+    fpr, tpr, _ = roc_curve(y_bin[:, i], prob_scores[:, i])
+    roc_auc     = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"{class_names[i]} (AUC={roc_auc:.3f})")
+
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curves (One-vs-Rest)")
+plt.legend()
+```
+
+A high per-class AUC (>0.98 is typical for well-separated content categories) confirms that the model's probability scores are well-calibrated even when the hard classification threshold occasionally mis-assigns a sample.
+
+## Full evaluation run
+
+<Steps>
+  <Step title="Load the checkpoint">
+    ```python
+    import torch
+    from model_train_new import SuperEnhancedTemporalModel
+
+    checkpoint = torch.load("models/best_ensemble_model_2.pt", map_location="cuda")
+    model = SuperEnhancedTemporalModel(**checkpoint['model_config']).to("cuda")
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    ```
+  </Step>
+  <Step title="Create the dataset and loader">
+    ```python
+    from src.utils.comprehensive_model_evaluation import (
+        MultiscaleH5Dataset, collate_features
+    )
+    from torch.utils.data import DataLoader
+
+    dataset = MultiscaleH5Dataset("features/test_features_multiscale.h5")
+    loader  = DataLoader(
+        dataset,
+        batch_size=48,
+        shuffle=False,
+        collate_fn=collate_features,
+    )
+    ```
+  </Step>
+  <Step title="Run inference and collect outputs">
+    ```python
+    all_probs, all_labels = [], []
+
+    with torch.no_grad():
+        for features, labels, lengths in loader:
+            features = features.to("cuda")
+            lengths  = lengths.to("cuda")
+            outputs  = model(features, lengths)
+            probs    = torch.nn.functional.softmax(outputs, dim=1)
+            all_probs.append(probs.cpu())
+            all_labels.append(labels)
+
+    all_probs  = torch.cat(all_probs)
+    all_labels = torch.cat(all_labels)
+    ```
+  </Step>
+  <Step title="Compute metrics">
+    ```python
+    from model_train_new import EnhancedTemporalModelTrainer
+
+    trainer = EnhancedTemporalModelTrainer(
+        features_dir="features",
+        output_dir="models",
+    )
+    trainer.num_classes = 4
+    metrics = trainer.compute_metrics(all_probs, all_labels)
+
+    print(f"Accuracy:    {metrics['accuracy']:.2f}%")
+    print(f"Weighted F1: {metrics['f1_weighted']:.2f}%")
+    print(f"Per-class F1: {metrics['f1_per_class']}")
+    ```
+  </Step>
+  <Step title="Generate confusion matrix and ROC curves">
+    Run the full evaluation script:
+
+    ```bash
+    python src/utils/comprehensive_model_evaluation.py \
+        --features features/test_features_multiscale.h5 \
+        --checkpoint models/best_ensemble_model_2.pt \
+        --output results/evaluation/
+    ```
+
+    Output files written to `results/evaluation/`:
+    - `confusion_matrix.png`
+    - `confusion_matrix_normalized.png`
+    - `roc_curves.png`
+    - `classification_report.json`
+  </Step>
+</Steps>
+
+<CardGroup cols={2}>
+  <Card title="Model training" href="/training/model-training">
+    Details on the training loop, checkpointing, and ensemble strategy.
+  </Card>
+  <Card title="Data preprocessing" href="/training/data-preprocessing">
+    How raw videos are converted into tensors before feature extraction.
+  </Card>
+</CardGroup>

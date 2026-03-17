@@ -1,0 +1,286 @@
+---
+title: "Feature extraction"
+description: "Extracting spatial CNN features using the EnhancedFeatureExtractor."
+---
+
+Training a temporal model directly on raw video tensors would require keeping a large CNN in GPU memory during every forward pass. The two-stage approach solves this by running the CNN once as a **frozen feature extractor** and caching the results to disk as HDF5 files. Stage 2 (temporal model training) then loads these compact feature vectors, allowing the BiLSTM + attention model to fit comfortably within a 9.8 GB GPU partition.
+
+## Two-stage rationale
+
+| Stage | What runs | GPU memory | Runs |
+|-------|-----------|------------|------|
+| Stage 1 — feature extraction | Frozen CNN only | 4–5 GB | Once |
+| Stage 2 — temporal training | BiLSTM + attention only | 6–7 GB | Iteratively (150 epochs) |
+
+Pre-extracting features reduces total training time from potentially hundreds of hours to 30–50 hours because the heavy CNN backbone only processes each frame once rather than once per epoch.
+
+## `EnhancedFeatureExtractor`
+
+### Constructor parameters
+
+```python
+class EnhancedFeatureExtractor:
+    def __init__(
+        self,
+        data_dir: str | Path,   # Root of preprocessed .pt files
+        output_dir: str | Path, # Where HDF5 output files are written
+        backbone: str = 'resnet101',
+        device: str = 'cuda',
+        multi_scale: bool = True,
+    ):
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `data_dir` | — | Root directory containing `train/`, `val/`, `test/` splits |
+| `output_dir` | — | Output directory for HDF5 feature files |
+| `backbone` | `'resnet101'` | CNN architecture (see table below) |
+| `device` | `'cuda'` | Falls back to CPU when CUDA is unavailable |
+| `multi_scale` | `True` | Extract at 3 temporal scales and average |
+
+### Supported backbones
+
+<CodeGroup>
+```python ResNet-50
+extractor = EnhancedFeatureExtractor(
+    data_dir="/data/processed",
+    output_dir="/features",
+    backbone="resnet50",
+    multi_scale=True,
+)
+```
+
+```python ResNet-101 (recommended)
+extractor = EnhancedFeatureExtractor(
+    data_dir="/data/processed",
+    output_dir="/features",
+    backbone="resnet101",
+    multi_scale=True,
+)
+```
+
+```python EfficientNet-V2-S
+extractor = EnhancedFeatureExtractor(
+    data_dir="/data/processed",
+    output_dir="/features",
+    backbone="efficientnet_v2_s",
+    multi_scale=True,
+)
+```
+
+```python EfficientNet-V2-M (best accuracy)
+extractor = EnhancedFeatureExtractor(
+    data_dir="/data/processed",
+    output_dir="/features",
+    backbone="efficientnet_v2_m",
+    multi_scale=True,
+)
+```
+</CodeGroup>
+
+### Backbone comparison
+
+| Backbone | Feature dim | Pretrained weights | Notes |
+|----------|-------------|-------------------|-------|
+| `resnet50` | 2048 | `IMAGENET1K_V2` | Fastest extraction |
+| `resnet101` | 2048 | `IMAGENET1K_V2` | +2–3% accuracy vs ResNet-50 |
+| `efficientnet_v2_s` | 1280 | `IMAGENET1K_V1` | Similar accuracy to ResNet-50, smaller features |
+| `efficientnet_v2_m` | 1280 | `IMAGENET1K_V1` | Best single-backbone accuracy (+3–4%) |
+
+<Note>
+The production ensemble in this project used **EfficientNet-V2-S** (`feature_dim=1280`), as confirmed by `configuration_analysis.json`. All four ensemble checkpoints were trained with 1280-dimensional features.
+</Note>
+
+All CNN parameters are frozen (`requires_grad=False`) before extraction begins:
+
+```python
+self.cnn = self.cnn.to(self.device)
+self.cnn.eval()
+for param in self.cnn.parameters():
+    param.requires_grad = False
+```
+
+## Multi-scale extraction
+
+When `multi_scale=True`, each video is processed at three temporal scales by resampling its frame sequence:
+
+| Scale | Effect |
+|-------|--------|
+| `1.0` | Original frame count — unchanged |
+| `0.85` | ~85% of frames (speed-up: captures fast motion) |
+| `1.15` | ~115% of frames (slow-down: captures fine transitions) |
+
+For each scale, CNN features are extracted frame-by-frame (in batches of `batch_size` frames). The three resulting feature tensors are zero-padded to the same length, then **averaged element-wise**:
+
+```python
+scales = [1.0, 0.85, 1.15]
+scale_features = []
+
+for scale in scales:
+    if scale != 1.0:
+        new_length = max(int(num_frames * scale), 5)
+        indices    = np.linspace(0, num_frames - 1, new_length).astype(int)
+        scaled_video = video[indices]
+    else:
+        scaled_video = video
+
+    frame_features = []
+    for i in range(0, scaled_video.shape[0], batch_size):
+        batch    = scaled_video[i:i+batch_size].to(self.device)
+        features = self.cnn(batch)         # [B, feature_dim]
+        frame_features.append(features.cpu())
+        del batch
+
+    scale_features.append(torch.cat(frame_features, dim=0))
+
+# Pad to max length and average
+max_len = max(sf.shape[0] for sf in scale_features)
+padded  = []
+for sf in scale_features:
+    if sf.shape[0] < max_len:
+        pad = torch.zeros(max_len - sf.shape[0], sf.shape[1])
+        sf  = torch.cat([sf, pad], dim=0)
+    padded.append(sf)
+
+video_features = torch.stack(padded).mean(dim=0)  # [max_len, feature_dim]
+```
+
+<Tip>
+Multi-scale extraction increases feature richness with negligible extra cost, because the dominant expense is loading the CNN weights and running the first forward pass — not re-running at slightly different frame counts.
+</Tip>
+
+## Output format
+
+Each split produces a compressed HDF5 file:
+
+| File | Contents |
+|------|----------|
+| `train_features_multiscale.h5` | Training set features |
+| `val_features_multiscale.h5` | Validation set features |
+| `test_features_multiscale.h5` | Test set features |
+
+(Without `multi_scale`, the suffix `_multiscale` is omitted.)
+
+### HDF5 datasets
+
+| Dataset key | Shape | dtype | Description |
+|-------------|-------|-------|-------------|
+| `features` | `[N, T_max, D]` | `float32` | Zero-padded feature sequences |
+| `labels` | `[N]` | `int64` | Integer category index |
+| `num_frames` | `[N]` | `int32` | True sequence length per video |
+
+### HDF5 file attributes
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `num_videos` | int | Total number of videos in this split |
+| `max_frames` | int | Maximum sequence length (= `T_max`) |
+| `feature_dim` | int | CNN output dimension |
+| `category_mapping` | JSON str | Maps category name → integer index |
+| `multi_scale` | bool | Whether multi-scale was used |
+
+Features are stored with gzip compression at level 4 to reduce disk footprint:
+
+```python
+h5_file.create_dataset(
+    'features',
+    data=padded_features,
+    compression='gzip',
+    compression_opts=4,
+)
+```
+
+## Memory management
+
+Feature extraction processes `batch_size=24` frames at a time per video. Every 50 videos, the GPU cache is explicitly cleared to prevent fragmentation on the MIG partition:
+
+```python
+if file_idx % 50 == 0:
+    torch.cuda.empty_cache()
+    gc.collect()
+```
+
+## Running extraction
+
+### Quick start
+
+```python
+from model_train_new import EnhancedFeatureExtractor
+
+extractor = EnhancedFeatureExtractor(
+    data_dir="/data/processed",
+    output_dir="/features_enhanced",
+    backbone="efficientnet_v2_m",   # best accuracy
+    device="cuda",
+    multi_scale=True,
+)
+
+# Processes train, val, and test splits sequentially
+extractor.extract_all_splits(batch_size=24)
+```
+
+`extract_all_splits()` calls `extract_features_from_split()` once for each of `['train', 'val', 'test']`:
+
+```python
+def extract_all_splits(self, batch_size=24):
+    for split in ['train', 'val', 'test']:
+        self.extract_features_from_split(split, batch_size)
+```
+
+<Steps>
+  <Step title="Scan video files">
+    The extractor walks `data_dir/{split}/{category}/{subcategory}/processed_data.pt` and builds an ordered list of all `.pt` files together with their integer category labels.
+  </Step>
+  <Step title="Extract CNN features">
+    For each video tensor `[T, C, H, W]` loaded from a `.pt` file, the CNN runs in `torch.no_grad()` mode. If `multi_scale=True`, three temporally-resampled versions are extracted and averaged.
+  </Step>
+  <Step title="Save HDF5">
+    All feature arrays are zero-padded to the maximum sequence length in the split and written as a single NumPy array to the HDF5 file along with `labels` and `num_frames` datasets.
+  </Step>
+</Steps>
+
+### Expected timing
+
+| Task | Duration |
+|------|----------|
+| Feature extraction (all splits) | 3–5 hours |
+
+<Warning>
+If the output HDF5 file already exists, the script will prompt you to confirm overwrite before proceeding. Running extraction again on an already-extracted split will delete the existing file.
+</Warning>
+
+## Verifying output
+
+After extraction, verify the HDF5 file with:
+
+```python
+import h5py, json
+
+with h5py.File("val_features_multiscale.h5", "r") as f:
+    print(f"Videos:      {f.attrs['num_videos']}")
+    print(f"Max frames:  {f.attrs['max_frames']}")
+    print(f"Feature dim: {f.attrs['feature_dim']}")
+    print(f"Categories:  {json.loads(f.attrs['category_mapping'])}")
+    print(f"Features:    {f['features'].shape}")   # (N, T_max, D)
+    print(f"Labels:      {f['labels'].shape}")
+```
+
+Expected output for the production test split:
+
+```
+Videos:      412
+Max frames:  73
+Feature dim: 1280
+Categories:  {"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}
+Features:    (412, 73, 1280)
+Labels:      (412,)
+```
+
+<CardGroup cols={2}>
+  <Card title="Data preprocessing" href="/training/data-preprocessing">
+    Produce the `.pt` video tensor files that the extractor reads.
+  </Card>
+  <Card title="Model training" href="/training/model-training">
+    Train the temporal model on the HDF5 feature files.
+  </Card>
+</CardGroup>

@@ -1,0 +1,337 @@
+---
+title: "Flask web application"
+description: "Deploy and use the browser-based video classification interface."
+---
+
+The web application wraps the inference pipeline in a Flask server and a Tailwind-styled single-page UI. Users pick a test-set video from a categorised grid, click **Analyze Video**, and see the predicted class plus a per-model confidence breakdown.
+
+## Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Python 3, Flask |
+| Frontend | HTML + Tailwind CSS (CDN) + vanilla JavaScript |
+| Inference | `test_already_extracted.py` (dynamically imported) |
+| Deep learning | PyTorch — auto-detects CUDA, falls back to CPU |
+
+## File layout
+
+```
+Flask Local New/
+├── app.py                    # Flask server and API endpoints
+├── index.html                # Single-page frontend
+├── test_already_extracted.py # SingleVideoFeatureLoader and SingleVideoClassifier
+└── model_train_new.py        # SuperEnhancedTemporalModel architecture
+```
+
+`app.py` dynamically imports `test_already_extracted.py` at startup using `importlib`. It looks for the file next to `app.py` first, then falls back to `/mnt/data/test_already_extracted.py`.
+
+## Directory configuration
+
+All data paths are resolved at the top of `app.py`. Local project-relative directories are preferred; fallback paths support deployment on shared storage mounts.
+
+| Variable | Primary path | Fallback |
+|---|---|---|
+| `FEATURES_DIR` | `features_enhanced/` (next to `app.py`) | `/mnt/data/features_enhanced` |
+| `MODELS_DIR` | `models_enhanced/` (next to `app.py`) | `/mnt/data/models_enhanced` |
+| `PROCESSED_TEST_DIR` | `data/processed/test` (next to `app.py`) | `/mnt/data/data/processed/test` |
+
+The four selected checkpoints are listed explicitly:
+
+```python
+SELECTED_CHECKPOINTS = [
+    "best_ensemble_model_1.pt",
+    "best_ensemble_model_2.pt",
+    "best_ensemble_model_3.pt",
+    "best_ensemble_model_4.pt",
+]
+```
+
+If none of the listed checkpoints exist in `MODELS_DIR`, the server falls back to any `.pt` file found in that directory and logs a warning.
+
+## Lazy singleton initialisation
+
+The feature loader and classifier are created on the first request that needs them, not at startup. This avoids blocking the server boot while models load.
+
+```python
+_feature_loader = None
+_classifier = None
+
+def get_feature_loader():
+    global _feature_loader
+    if _feature_loader is None:
+        _feature_loader = user_module.SingleVideoFeatureLoader(
+            features_dir=str(FEATURES_DIR),
+            processed_test_dir=str(PROCESSED_TEST_DIR),
+        )
+    return _feature_loader
+
+def get_classifier(device="cuda"):
+    global _classifier
+    if _classifier is None:
+        # resolve checkpoint paths that exist on disk
+        paths = [str(MODELS_DIR / name) for name in SELECTED_CHECKPOINTS
+                 if (MODELS_DIR / name).exists()]
+        device_arg = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
+        _classifier = user_module.SingleVideoClassifier(
+            checkpoint_paths=paths, device=device_arg
+        )
+        _classifier.load_models()
+    return _classifier
+```
+
+<Warning>
+  The first classify request after a cold start will be slow (several seconds) because `load_models()` is called at that point. Subsequent requests use the cached singleton and are fast.
+</Warning>
+
+## Starting the server
+
+<Steps>
+  <Step title="Install dependencies">
+    ```bash
+    pip install flask torch torchvision h5py opencv-python requests
+    # optional: pip install yt-dlp  (for external video URL support in CLI mode)
+    ```
+  </Step>
+
+  <Step title="Arrange files">
+    Place all four files (`app.py`, `index.html`, `test_already_extracted.py`, `model_train_new.py`) in the same directory. Ensure `features_enhanced/`, `models_enhanced/`, and `data/processed/test` exist relative to `app.py`, or set the fallback paths.
+  </Step>
+
+  <Step title="Start the server">
+    ```bash
+    python app.py
+    ```
+
+    Expected startup output:
+
+    ```
+    Index HTML path: /path/to/Flask Local New/index.html
+    User script path: /path/to/Flask Local New/test_already_extracted.py
+    Features dir: /path/to/Flask Local New/features_enhanced
+    Models dir: /path/to/Flask Local New/models_enhanced
+    Processed test dir: /path/to/Flask Local New/data/processed/test
+     * Running on http://0.0.0.0:5000
+    ```
+  </Step>
+
+  <Step title="Open the UI">
+    Navigate to `http://localhost:5000` in your browser. The page fetches `/api/videos` on load and renders a categorised grid of all available test-set videos.
+  </Step>
+</Steps>
+
+## API endpoints
+
+### `GET /`
+
+Serves `index.html`. Returns HTTP 500 with a plain-text error if the file is not found.
+
+---
+
+### `GET /api/videos`
+
+Returns all available test-set videos grouped by category.
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:5000/api/videos
+```
+
+```python Python client
+import requests
+resp = requests.get("http://localhost:5000/api/videos")
+data = resp.json()
+for category, names in data["videos"].items():
+    print(f"{category}: {len(names)} videos")
+```
+
+</CodeGroup>
+
+**Response**
+
+```json
+{
+  "success": true,
+  "videos": {
+    "Animation": ["clip_001.mp4", "clip_002.mp4"],
+    "Flat_Content": ["screen_001.mp4"],
+    "Gaming": ["game_001.mp4", "game_002.mp4"],
+    "Natural_Content": ["nature_001.mp4"]
+  }
+}
+```
+
+<ResponseField name="success" type="boolean" required>
+  `true` on success, `false` on error.
+</ResponseField>
+
+<ResponseField name="videos" type="object">
+  Keys are category names; values are arrays of video filename strings.
+</ResponseField>
+
+---
+
+### `POST /api/classify`
+
+Classifies a dataset video and returns the predicted category, confidence, and per-model breakdown.
+
+**Request parameters** (multipart form-data)
+
+<ParamField path="body.selected_video" type="string" required>
+  The exact video filename as returned by `/api/videos` (e.g., `"clip_001.mp4"`).
+</ParamField>
+
+<ParamField path="body.use_tta" type="string" default="false">
+  Pass `"true"` to enable Test-Time Augmentation. Increases latency roughly 4×.
+</ParamField>
+
+<CodeGroup>
+
+```bash curl (standard)
+curl -X POST http://localhost:5000/api/classify \
+  -F "selected_video=clip_001.mp4" \
+  -F "use_tta=false"
+```
+
+```bash curl (with TTA)
+curl -X POST http://localhost:5000/api/classify \
+  -F "selected_video=clip_001.mp4" \
+  -F "use_tta=true"
+```
+
+```python Python client
+import requests
+
+resp = requests.post(
+    "http://localhost:5000/api/classify",
+    data={
+        "selected_video": "clip_001.mp4",
+        "use_tta": "false",
+    },
+)
+result = resp.json()["result"]
+print(result["category"], f"{result['confidence']:.1f}%")
+```
+
+</CodeGroup>
+
+**Response**
+
+```json
+{
+  "success": true,
+  "result": {
+    "category": "Gaming",
+    "confidence": 97.43,
+    "video_name": "clip_001.mp4",
+    "all_scores": {
+      "Animation": 0.21,
+      "Flat_Content": 0.89,
+      "Gaming": 97.43,
+      "Natural_Content": 1.47
+    },
+    "model_scores": [
+      {
+        "model": "best_ensemble_model_1.pt",
+        "confidence": 94.10,
+        "probs": [0.18, 0.72, 94.10, 5.00]
+      },
+      {
+        "model": "best_ensemble_model_2.pt",
+        "confidence": 98.61,
+        "probs": [0.09, 0.41, 98.61, 0.89]
+      },
+      {
+        "model": "best_ensemble_model_3.pt",
+        "confidence": 98.22,
+        "probs": [0.30, 1.10, 98.22, 0.38]
+      },
+      {
+        "model": "best_ensemble_model_4.pt",
+        "confidence": 98.80,
+        "probs": [0.27, 0.92, 98.80, 0.01]
+      }
+    ]
+  }
+}
+```
+
+<ResponseField name="success" type="boolean" required>
+  `true` on success, `false` on error.
+</ResponseField>
+
+<ResponseField name="result" type="object">
+  <Expandable title="result properties">
+    <ResponseField name="category" type="string">
+      Predicted class name: `Animation`, `Flat_Content`, `Gaming`, or `Natural_Content`.
+    </ResponseField>
+
+    <ResponseField name="confidence" type="float">
+      Confidence of the top class as a percentage (0–100).
+    </ResponseField>
+
+    <ResponseField name="video_name" type="string">
+      Echo of the `selected_video` request parameter.
+    </ResponseField>
+
+    <ResponseField name="all_scores" type="object">
+      Mapping of every class name to its ensemble probability as a percentage.
+    </ResponseField>
+
+    <ResponseField name="model_scores" type="array">
+      One entry per loaded checkpoint.
+
+      <Expandable title="model_scores item">
+        <ResponseField name="model" type="string">
+          Checkpoint filename (e.g., `"best_ensemble_model_2.pt"`).
+        </ResponseField>
+        <ResponseField name="confidence" type="float">
+          Top-class probability for this model as a percentage.
+        </ResponseField>
+        <ResponseField name="probs" type="array[float]">
+          All four class probabilities for this model as percentages, ordered `[Animation, Flat_Content, Gaming, Natural_Content]`.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+**Error responses**
+
+| HTTP status | Cause |
+|---|---|
+| 400 | `selected_video` not provided, or video not found in dataset |
+| 500 | Classifier or feature loader failed to initialise, or inference error |
+
+Error responses have the shape `{"success": false, "error": "...", "trace": "..."}`.
+
+## Frontend behaviour
+
+The `index.html` page has three view states managed with CSS `hidden` toggling:
+
+1. **Selection** — On load, `fetch('/api/videos')` populates a card grid organised by category. Clicking a card highlights it and shows a preview bar with an **Analyze Video** button.
+2. **Processing** — A progress bar animates across seven labelled steps (`Loading Features`, `Running Model 1–4`, `Ensemble Prediction`, `Finalising Results`) while the `/api/classify` POST request is in flight.
+3. **Results** — Displays the predicted category name, top confidence score, and an individual model breakdown card for each checkpoint showing per-class probability bars.
+
+The `categoryConfig` object in the page's JavaScript assigns each category a Tailwind gradient colour and an emoji for visual distinction:
+
+| Category | Emoji | Gradient |
+|---|---|---|
+| Animation | 🎨 | purple → pink |
+| Gaming | 🎮 | blue → cyan |
+| Natural_Content | 🌿 | green → emerald |
+| Flat_Content | 📊 | orange → amber |
+
+<Note>
+  The frontend does not support external video URLs. That workflow is available only through `test_already_extracted.py`'s interactive CLI mode.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Single-video inference" icon="film" href="/inference/single-video">
+    Full API reference for `SingleVideoFeatureLoader` and `SingleVideoClassifier`.
+  </Card>
+  <Card title="Ensemble and TTA" icon="layer-group" href="/inference/ensemble-tta">
+    How the four-model ensemble and TTA are implemented.
+  </Card>
+</CardGroup>

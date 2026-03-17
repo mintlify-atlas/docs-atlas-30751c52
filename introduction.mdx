@@ -1,0 +1,99 @@
+---
+title: Introduction
+description: An end-to-end deep learning system for multi-class video classification using CNN + Bi-LSTM + Multi-Head Attention architecture.
+---
+
+# NVIDIA Video Classification
+
+An industry-sponsored deep learning project developed in collaboration with NVIDIA, designed to classify video content into four categories with ~93–95% accuracy. This project was trained on an **NVIDIA A100 GPU (MIG partition)** and demonstrates a production-ready two-stage spatial-temporal pipeline built entirely from scratch.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Set up the environment and run your first video classification in minutes
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/concepts/architecture-overview">
+    Understand the two-stage CNN + Bi-LSTM + Attention design
+  </Card>
+  <Card title="Training Guide" icon="brain" href="/training/data-preprocessing">
+    Walk through data preprocessing, feature extraction, and model training
+  </Card>
+  <Card title="Flask App" icon="globe" href="/inference/flask-app">
+    Deploy and use the web-based inference application
+  </Card>
+</CardGroup>
+
+## What this project does
+
+The system classifies videos into four content categories:
+
+| Category | Description |
+|----------|-------------|
+| **Animation** | Animated films, cartoons, CGI content |
+| **Gaming** | Video game footage, gameplay recordings |
+| **Natural Content** | Real-world footage: nature, sports, people |
+| **Flat Content** | Screen recordings, slideshows, static visuals |
+
+Unlike image classifiers, this system models both **spatial appearance** (per-frame features) and **temporal dynamics** (motion patterns across the video sequence).
+
+## Key highlights
+
+<CardGroup cols={2}>
+  <Card title="~95% Accuracy" icon="chart-bar">
+    Achieves 93% standard and ~95% with Test-Time Augmentation on the YouTube-8M derived dataset
+  </Card>
+  <Card title="Two-Stage Pipeline" icon="layer-group">
+    Stage 1 extracts spatial CNN features; Stage 2 models temporal patterns with Bi-LSTM and attention
+  </Card>
+  <Card title="4-Model Ensemble" icon="cubes">
+    Ensemble of four independently trained models for robust, high-confidence predictions
+  </Card>
+  <Card title="Flask Web App" icon="display">
+    Browser-based demo for selecting dataset videos and viewing per-model confidence breakdowns
+  </Card>
+</CardGroup>
+
+## System architecture at a glance
+
+```
+Video Input
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  STAGE 1: Spatial Feature Extraction    │
+│  CNN Backbone (ResNet-101 / EfficientNet│
+│  Feature dim: 1280  |  Multi-scale      │
+└─────────────────────┬───────────────────┘
+                      │  Frame features [T × 1280]
+                      ▼
+┌─────────────────────────────────────────┐
+│  STAGE 2: Temporal Modeling             │
+│  Input Projection + LayerNorm           │
+│  4-layer Bidirectional LSTM (768-dim)   │
+│  12-head Multi-Head Self-Attention      │
+│  Attention Pooling                      │
+│  3-layer MLP Classifier                 │
+└─────────────────────┬───────────────────┘
+                      │
+                      ▼
+         Class Prediction (4 classes)
+```
+
+## Team
+
+- **Manas Kulkarni**
+- **Samiksha Nalawade**
+- **Rajlakshmi Desai**
+
+**Faculty Guide:** Dr. Shripad Bhatlawande  
+**Industry Sponsor:** NVIDIA
+
+## Hardware & software
+
+| Component | Specification |
+|-----------|---------------|
+| GPU | NVIDIA A100 (MIG – 9.8 GB VRAM) |
+| CPU | Intel Xeon Gold |
+| RAM | 251 GB |
+| Framework | PyTorch |
+| CUDA | 11.8 + cuDNN |
+| Dataset | YouTube-8M (~4,000 videos) |

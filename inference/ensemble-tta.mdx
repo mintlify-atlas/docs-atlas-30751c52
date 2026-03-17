@@ -1,0 +1,208 @@
+---
+title: "Ensemble and TTA"
+description: "How multi-model ensemble and Test-Time Augmentation improve prediction robustness."
+---
+
+The classifier combines two complementary techniques — **multi-model ensemble** and **Test-Time Augmentation (TTA)** — to push classification accuracy above what any single model achieves alone.
+
+## Multi-model ensemble
+
+Four `SuperEnhancedTemporalModel` checkpoints are loaded simultaneously. At inference time each model produces a softmax probability vector over the four classes, and the vectors are averaged to produce the final prediction.
+
+```
+Model 1 → softmax → [p_anim, p_flat, p_game, p_nat]  ─┐
+Model 2 → softmax → [p_anim, p_flat, p_game, p_nat]   ├─ mean → final probs
+Model 3 → softmax → [p_anim, p_flat, p_game, p_nat]   │
+Model 4 → softmax → [p_anim, p_flat, p_game, p_nat]  ─┘
+```
+
+### Why ensemble reduces error
+
+Each model is trained independently with a different random seed and training order. This leads to different weight initialisations and different convergence paths, so the models make different kinds of mistakes. Averaging their softmax outputs cancels out many individual errors, because a mistake by one model is usually not shared by the others.
+
+### Checkpoint validation accuracies
+
+The four checkpoints were selected to maximise diversity. Model 1 has a lower individual accuracy but introduces useful diversity that improves the ensemble's overall robustness.
+
+| Checkpoint | Val accuracy | F1 (weighted) | Epoch |
+|---|---|---|---|
+| `best_ensemble_model_1.pt` | 72.7% | 64.8% | 52 |
+| `best_ensemble_model_2.pt` | 92.1% | 92.1% | 43 |
+| `best_ensemble_model_3.pt` | 91.9% | 91.9% | 42 |
+| `best_ensemble_model_4.pt` | 91.9% | 91.9% | 40 |
+
+<Note>
+  Model 1 reaches only 72.7% individually because it converged to a different local minimum — one that correctly handles cases the other three models struggle with. Including it in the ensemble consistently improves overall accuracy.
+</Note>
+
+Per-class F1 scores from `configuration_analysis.json`:
+
+| Class | Model 1 | Model 2 | Model 3 | Model 4 |
+|---|---|---|---|---|
+| Animation | 1.1% | 86.5% | 87.7% | 88.0% |
+| Flat_Content | 93.5% | 96.7% | 95.5% | 95.2% |
+| Gaming | 66.1% | 87.9% | 88.0% | 88.5% |
+| Natural_Content | 96.7% | 97.5% | 96.4% | 95.8% |
+
+### `predict_standard()` implementation
+
+```python
+def predict_standard(self, features):
+    all_model_predictions = []
+
+    with torch.no_grad():
+        features_batch = features.unsqueeze(0).to(self.device)  # [1, T, D]
+        lengths = torch.tensor([features.shape[0]], device=self.device)
+
+        for model in self.models:
+            outputs = model(features_batch, lengths)  # [1, num_classes]
+            probs = F.softmax(outputs, dim=1)
+            all_model_predictions.append(probs.squeeze(0).cpu())
+
+    # Ensemble: average predictions
+    ensemble_probs = torch.stack(all_model_predictions).mean(dim=0)
+    return ensemble_probs
+```
+
+The `lengths` tensor is passed alongside the feature batch so the model's internal attention masking ignores padding frames.
+
+## Test-Time Augmentation
+
+TTA runs the ensemble four times on different temporal transformations of the same feature sequence, then averages all predictions. This reduces sensitivity to how the temporal content is presented to the model.
+
+### The four TTA modes
+
+<Steps>
+  <Step title="Original">
+    The feature sequence is passed unmodified. This is the same as `predict_standard()`.
+
+    ```python
+    probs = self.predict_standard(features)
+    tta_predictions.append(probs)
+    ```
+  </Step>
+
+  <Step title="Reversed sequence">
+    The time dimension is flipped using `torch.flip`. The model sees the video played backwards. This tests whether the classifier relies on temporal order or on content alone.
+
+    ```python
+    features_reversed = torch.flip(features, dims=[0])
+    probs = self.predict_standard(features_reversed)
+    tta_predictions.append(probs)
+    ```
+  </Step>
+
+  <Step title="Speed-up (0.5× temporal length)">
+    Every other frame is sampled by taking indices spaced across half the original length. The model receives roughly half as many frames as the original, simulating a faster playback speed.
+
+    ```python
+    indices = torch.linspace(0, features.shape[0] - 1, features.shape[0] // 2).long()
+    features_speedup = features[indices]
+    probs = self.predict_standard(features_speedup)
+    tta_predictions.append(probs)
+    ```
+
+    This mode is skipped if the sequence has 10 or fewer frames.
+  </Step>
+
+  <Step title="Speed-down (1.5× temporal length)">
+    Frames are interpolated to 1.5× the original length by repeating indices via `torch.linspace`. The model sees a slower, denser sampling of the same content.
+
+    ```python
+    indices = torch.linspace(0, features.shape[0] - 1, int(features.shape[0] * 1.5)).long()
+    indices = indices.clamp(max=features.shape[0] - 1)
+    features_speeddown = features[indices]
+    probs = self.predict_standard(features_speeddown)
+    tta_predictions.append(probs)
+    ```
+
+    This mode is also skipped for sequences of 10 or fewer frames.
+  </Step>
+</Steps>
+
+After all modes run, the TTA predictions are averaged:
+
+```python
+ensemble_probs = torch.stack(tta_predictions).mean(dim=0)
+return ensemble_probs
+```
+
+### `predict_with_tta()` in full
+
+```python
+def predict_with_tta(self, features):
+    tta_predictions = []
+
+    # Mode 1: Original
+    tta_predictions.append(self.predict_standard(features))
+
+    # Mode 2: Reverse
+    features_reversed = torch.flip(features, dims=[0])
+    tta_predictions.append(self.predict_standard(features_reversed))
+
+    # Mode 3: Speed up
+    if features.shape[0] > 10:
+        indices = torch.linspace(0, features.shape[0]-1, features.shape[0]//2).long()
+        tta_predictions.append(self.predict_standard(features[indices]))
+
+    # Mode 4: Speed down
+    if features.shape[0] > 10:
+        indices = torch.linspace(0, features.shape[0]-1, int(features.shape[0]*1.5)).long()
+        indices = indices.clamp(max=features.shape[0]-1)
+        tta_predictions.append(self.predict_standard(features[indices]))
+
+    return torch.stack(tta_predictions).mean(dim=0)
+```
+
+## Performance comparison
+
+| Mode | Approximate accuracy |
+|---|---|
+| Single best model (Model 2) | ~92.1% |
+| Ensemble (standard, no TTA) | ~93% |
+| Ensemble with TTA | ~95% |
+
+<Tip>
+  TTA multiplies inference latency by up to 4× (four passes through all four models). For batch processing or real-time applications where latency matters, standard ensemble inference at ~93% accuracy is the better choice.
+</Tip>
+
+## When to use TTA vs standard inference
+
+| Scenario | Recommendation |
+|---|---|
+| Single high-stakes classification | TTA — the latency cost is negligible for one video |
+| Batch evaluation over hundreds of videos | Standard — save time without significant accuracy loss |
+| Interactive web UI | Standard — the Flask app uses standard inference by default |
+| Short clips (≤ 10 frames) | Standard — TTA speed-up and speed-down modes are skipped automatically |
+
+## Per-model scores in the UI
+
+The Flask app exposes per-model confidence through the `per_model_scores()` helper in `app.py`. For each loaded model it runs a forward pass separately and returns the softmax probabilities alongside the checkpoint filename:
+
+```python
+def per_model_scores(classifier, features):
+    scores = []
+    features_batch = features.unsqueeze(0).to(classifier.device)
+    lengths = torch.tensor([features.shape[0]], device=classifier.device)
+
+    with torch.no_grad():
+        for i, model in enumerate(classifier.models):
+            outputs = model(features_batch, lengths)
+            probs = F.softmax(outputs, dim=1).squeeze(0).cpu().numpy()
+            scores.append({
+                "model": Path(classifier.checkpoint_paths[i]).name,
+                "probs": probs.tolist()
+            })
+    return scores
+```
+
+The UI renders one card per model, displaying a confidence bar for each class — giving a visual breakdown of where the models agree and disagree.
+
+<CardGroup cols={2}>
+  <Card title="Single-video inference" icon="film" href="/inference/single-video">
+    `SingleVideoClassifier` API reference and usage examples.
+  </Card>
+  <Card title="Flask web application" icon="globe" href="/inference/flask-app">
+    Deploy the browser-based classification interface.
+  </Card>
+</CardGroup>

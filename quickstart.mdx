@@ -1,80 +1,272 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get the NVIDIA Video Classification system running in minutes.
 ---
 
-## Get started in three steps
+This guide walks you through setting up the NVIDIA Video Classification system locally, installing dependencies, and running your first inference — either through the Flask web app or directly from the command line.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, make sure you have the following installed:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- **Python 3.8+**
+- **pip** (Python package manager)
+- **Git**
+- **CUDA 11.8+** and **cuDNN** — required for GPU-accelerated inference (CPU fallback is available)
+- **NVIDIA GPU** with at least 4 GB VRAM recommended (the system was trained on an NVIDIA A100 MIG partition with 9.8 GB VRAM)
 
-### Step 2: Deploy your changes
+<Note>
+  The system automatically falls back to CPU if CUDA is not available. GPU inference is significantly faster, especially when loading all four ensemble models.
+</Note>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+## Setup
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+<Steps>
+  <Step title="Clone the repository">
+    Clone the project repository to your local machine:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    git clone <your-repo-url> nvidia-video-classification
+    cd nvidia-video-classification
+    ```
+  </Step>
 
-### Step 3: Go live
+  <Step title="Create a virtual environment (recommended)">
+    Create and activate a Python virtual environment to keep dependencies isolated:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <CodeGroup>
+
+    ```bash Linux / macOS
+    python -m venv venv
+    source venv/bin/activate
+    ```
+
+    ```bash Windows
+    python -m venv venv
+    venv\Scripts\activate
+    ```
+
+    </CodeGroup>
+  </Step>
+
+  <Step title="Install dependencies">
+    Install all required packages:
+
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+    The key dependencies are:
+
+    | Package | Purpose |
+    |---|---|
+    | `torch`, `torchvision` | Deep learning framework and pretrained CNN backbones |
+    | `flask` | Web server for the inference UI |
+    | `opencv-python` | Video frame extraction and preprocessing |
+    | `h5py` | Reading pre-extracted features stored in HDF5 format |
+    | `numpy`, `pandas` | Numerical computation and data handling |
+    | `scikit-learn` | Metrics (F1, precision, recall) |
+    | `tqdm` | Progress bars during batch inference |
+    | `matplotlib`, `seaborn` | Training plots and confusion matrices |
+    | `psutil` | System resource monitoring |
+    | `requests` | HTTP downloads for external video URLs |
+    | `yt-dlp` | *(Optional)* Downloading videos from YouTube and other platforms |
+
+    <Tip>
+      Install `yt-dlp` separately if you plan to classify videos from external URLs: `pip install yt-dlp`
+    </Tip>
+  </Step>
+
+  <Step title="Verify model checkpoints and feature files">
+    Before running the app, confirm that the following files are present inside the `Flask Local New/` directory:
+
+    ```
+    Flask Local New/
+    ├── app.py
+    ├── test_already_extracted.py
+    ├── model_train_new.py
+    ├── index.html
+    ├── models_enhanced/
+    │   ├── best_ensemble_model_1.pt
+    │   ├── best_ensemble_model_2.pt
+    │   ├── best_ensemble_model_3.pt
+    │   └── best_ensemble_model_4.pt
+    ├── features_enhanced/
+    │   └── test_features_multiscale.h5
+    └── data/
+        └── processed/
+            └── test/
+                ├── Animation/
+                ├── Flat_Content/
+                ├── Gaming/
+                └── Natural_Content/
+    ```
+
+    <Warning>
+      The app will not start if `test_already_extracted.py` is missing from the same directory as `app.py`. All four model checkpoints must be present in `models_enhanced/` for full ensemble inference.
+    </Warning>
+  </Step>
+</Steps>
+
+## Running the Flask web app
+
+<Steps>
+  <Step title="Start the server">
+    Navigate to the `Flask Local New/` directory and launch the app:
+
+    ```bash
+    cd "Flask Local New"
+    python app.py
+    ```
+
+    On startup, the app prints the resolved paths for all required files and directories:
+
+    ```
+    Index HTML path: /path/to/Flask Local New/index.html
+    User script path: /path/to/Flask Local New/test_already_extracted.py
+    Features dir: /path/to/Flask Local New/features_enhanced
+    Models dir: /path/to/Flask Local New/models_enhanced
+    Processed test dir: /path/to/Flask Local New/data/processed/test
+    ```
+  </Step>
+
+  <Step title="Open the UI">
+    Open your browser and go to:
+
+    ```
+    http://localhost:5000
+    ```
+
+    The web interface lets you:
+
+    - Browse available test videos grouped by category
+    - Select a video from the dataset
+    - Enable or disable Test-Time Augmentation (TTA)
+    - Run ensemble inference and view results
+  </Step>
+</Steps>
+
+<Note>
+  The server binds to `0.0.0.0:5000`, so it is accessible from other devices on the same network. In production, place it behind a reverse proxy and restrict access appropriately.
+</Note>
+
+## Running single-video inference from the command line
+
+You can also run inference interactively without the web server using `test_already_extracted.py`:
+
+```bash
+cd "Flask Local New"
+python test_already_extracted.py
+```
+
+The script starts in **interactive mode** and prompts you to select a video. You can provide:
+
+- A **video number** from the displayed list (e.g., `42`)
+- A **filename** from the dataset (e.g., `my_video.mp4`)
+- A **local file path** to a video outside the dataset
+- A **URL** (YouTube or direct `.mp4` link) — requires `yt-dlp` for YouTube
+
+### Example session
+
+```
+SINGLE VIDEO INFERENCE - INTERACTIVE MODE
+Using pre-extracted features from features_enhanced folder or external video URL/local file
+
+Animation (12 videos):
+     1. video_001.mp4
+     2. video_002.mp4
+   ...
+Gaming (18 videos):
+    13. video_g001.mp4
+   ...
+
+Enter video number or filename (or 'test' to run accuracy test, or paste a URL/local path): 1
+```
+
+After selecting a video, the classifier loads all four ensemble models and runs inference.
+
+### Batch accuracy test
+
+Enter `test` at the prompt to run a batch accuracy evaluation on a random sample of videos from the test set. You will be asked how many videos to test and whether to enable TTA.
+
+## Understanding the output
+
+### Web app response
+
+After classification, the API returns a JSON result with:
+
+```json
+{
+  "category": "Gaming",
+  "confidence": 97.43,
+  "all_scores": {
+    "Animation": 0.82,
+    "Flat_Content": 0.91,
+    "Gaming": 97.43,
+    "Natural_Content": 0.84
+  },
+  "model_scores": [
+    { "model": "best_ensemble_model_1.pt", "confidence": 96.10, "probs": [...] },
+    { "model": "best_ensemble_model_2.pt", "confidence": 97.80, "probs": [...] },
+    { "model": "best_ensemble_model_3.pt", "confidence": 98.22, "probs": [...] },
+    { "model": "best_ensemble_model_4.pt", "confidence": 97.60, "probs": [...] }
+  ],
+  "video_name": "video_g001.mp4"
+}
+```
+
+### Command-line output
+
+The CLI script displays a bar chart of confidence scores for all four classes, sorted by confidence:
+
+```
+CLASSIFICATION RESULTS
+
+Video: video_g001.mp4
+True Class: Gaming
+
+Predicted Class: Gaming
+Confidence: 97.43%
+CORRECT
+
+All Class Scores:
+----------------------------------------
+   Gaming               ████████████████████████████████████████████████░░  97.43%
+   Animation            ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.82%
+   Natural_Content      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.84%
+   Flat_Content         ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.91%
+```
+
+### Classes and confidence
+
+The model classifies videos into four categories:
+
+| Class | Description |
+|---|---|
+| `Animation` | Animated video content |
+| `Flat_Content` | Screen recordings, slides, or UI-heavy content |
+| `Gaming` | Video game footage |
+| `Natural_Content` | Real-world footage (nature, people, events) |
+
+**Confidence** is the softmax probability of the predicted class, averaged across all four ensemble models. Values above 90% indicate high certainty. Enabling TTA can raise accuracy by 1–2% on borderline cases.
+
+<Tip>
+  Enable **Test-Time Augmentation (TTA)** for more reliable predictions on ambiguous videos. TTA runs inference four times with different temporal augmentations (original, reversed, speed-up, slow-down) and averages the results.
+</Tip>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture overview" icon="brain" href="/concepts/architecture-overview">
+    Learn about the CNN + Bi-LSTM + Multi-Head Attention pipeline that powers classification.
+  </Card>
+  <Card title="Ensemble and TTA" icon="play" href="/inference/ensemble-tta">
+    Explore advanced inference options including TTA and multi-model ensemble.
+  </Card>
+  <Card title="Flask web app" icon="code" href="/inference/flask-app">
+    Integrate the Flask API into your own application.
+  </Card>
+  <Card title="Model training" icon="chart-line" href="/training/model-training">
+    Understand how the models were trained on YouTube-8M data using NVIDIA A100 GPUs.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

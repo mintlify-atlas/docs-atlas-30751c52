@@ -1,0 +1,261 @@
+---
+title: "Data preprocessing"
+description: "Preparing raw videos for feature extraction."
+---
+
+Raw video files must be decoded, sampled, resized, and saved as PyTorch tensors before the CNN feature extractor can consume them. This page covers the directory layout, `VideoPreprocessor` settings, the `EnhancedPreExtractedFeaturesDataset` class, the `collate_features` function, and how weighted sampling handles class imbalance.
+
+## Directory structure
+
+After preprocessing, the output directory follows a strict three-level hierarchy:
+
+```
+data/processed/
+├── train/
+│   ├── Animation/
+│   │   ├── Cartoon/
+│   │   │   └── processed_data.pt
+│   │   └── Naruto/
+│   │       └── processed_data.pt
+│   ├── Gaming/
+│   ├── Natural_Content/
+│   └── Flat_Content/
+├── val/
+│   └── ...
+└── test/
+    └── ...
+```
+
+Each `processed_data.pt` file is a Python dict saved with `torch.save`:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `videos` | `Tensor [B, T, C, H, W]` | Stack of preprocessed video clips |
+| `labels` | `Tensor [B]` | Integer category index per video |
+| `filenames` | `list[str]` | Original filename for each video |
+| `category_mapping` | `dict` | Maps category name to integer index |
+
+<Note>
+The tensor dtype is `float32` and values are ImageNet-normalized (`mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]`). Ensure downstream code does **not** apply normalization a second time.
+</Note>
+
+## Preprocessing settings
+
+| Parameter | Value |
+|-----------|-------|
+| Frames per video | 64 |
+| Resolution | 256 × 256 px |
+| Clip duration | 10 seconds |
+| Processing mode | GPU (MIG-aware) or CPU |
+| Normalization | ImageNet mean/std |
+
+## Dataset split
+
+| Split | Proportion |
+|-------|-----------|
+| Train | 70% |
+| Val | 20% |
+| Test | 10% |
+
+## Category structure
+
+The dataset contains **4 top-level categories** and **46 subcategories** in total.
+
+| Category | Subcategories |
+|----------|---------------|
+| Animation | Cartoon, Animation, Lego minifigure, Naruto, The Walt Disney Company, Dragon Ball, Sonic the Hedgehog, One Piece, Bleach |
+| Gaming | Games, Video game, Minecraft, Call of Duty, Grand Theft Auto, Grand Theft Auto V, World of Warcraft, League of Legends, Battlefield, RuneScape, Action-adventure game, FIFA 15 |
+| Natural Content | Animal, Pet, Fishing, Fish, Outdoor recreation, Dog, Horse, Bird, Plant, Cat, Farm, Garden, Nature, Tree, Wildlife, Chicken |
+| Flat Content | Website, Chart, Map, Logo, Text, Typography, Screencast, Illustration, Poster |
+
+## Frame sampling strategies
+
+The `VideoPreprocessor` supports five frame sampling strategies. For dynamic content such as Gaming and Animation, **Adaptive Multi-Clip** is recommended because it captures temporal variation from the beginning, middle, and end of the video.
+
+| Strategy | Description |
+|----------|-------------|
+| `uniform` | Sample frames evenly across the full video |
+| `middle_clip` | Focus on the central 10-second window |
+| `random_clip` | Pick a random 10-second window |
+| `multi_clip` | Three fixed clips at 20%, 50%, and 80% positions |
+| `adaptive_multi_clip` | Multi-clip for Gaming/Animation; middle clip otherwise |
+
+<Tip>
+For **Gaming** and **Animation** subcategories, select `adaptive_multi_clip`. This strategy samples three temporal segments (early, middle, late) rather than a single window, capturing action sequences that are unevenly distributed across the timeline.
+</Tip>
+
+## Running the preprocessor
+
+<Steps>
+  <Step title="Instantiate VideoPreprocessor">
+    ```python
+    from src.data.preprocess_videos import VideoPreprocessor
+
+    preprocessor = VideoPreprocessor(
+        input_dir="/data/raw",
+        output_dir="/data/processed",
+        frames_per_video=64,
+        img_size=(256, 256),
+        clip_duration=10
+    )
+    ```
+  </Step>
+  <Step title="Select processing mode">
+    Call `interactive_process()`. The script first prompts for CPU or GPU mode. GPU mode is recommended for large datasets — it uses a MIG-aware batch size computed from available VRAM (40% of free memory, capped at 4).
+
+    ```python
+    preprocessor.interactive_process()
+    ```
+  </Step>
+  <Step title="Choose preprocessing mode">
+    - **Interactive** — configure the sampling strategy per subcategory as each one is processed.
+    - **Bulk** — configure all strategies upfront, then process without further prompts.
+  </Step>
+  <Step title="Resume interrupted runs">
+    A `resume_checkpoint.json` file is written after every subcategory completes. Re-running the script and selecting the same output directory automatically skips already-processed subcategories.
+  </Step>
+</Steps>
+
+## `EnhancedPreExtractedFeaturesDataset`
+
+This `Dataset` class reads the HDF5 feature files produced by `EnhancedFeatureExtractor` (see [Feature extraction](/training/feature-extraction)). It supports three augmentation modes controlled by the `augment` and `tta_mode` constructor arguments.
+
+```python
+class EnhancedPreExtractedFeaturesDataset(Dataset):
+    def __init__(self, feature_file, augment=False, tta_mode=None):
+        self.h5_file = h5py.File(feature_file, 'r')
+        self.features   = self.h5_file['features']    # [N, T, D] — lazy-loaded
+        self.labels     = self.h5_file['labels'][:]
+        self.num_frames = self.h5_file['num_frames'][:]
+        ...
+
+    def __getitem__(self, idx):
+        features  = self.features[idx][:self.num_frames[idx]]
+        features  = torch.from_numpy(features.copy())
+
+        # TTA transformations (inference only)
+        if self.tta_mode == 'reverse':
+            features = torch.flip(features, dims=[0])
+        elif self.tta_mode == 'speed_up':
+            if self.num_frames[idx] > 10:
+                indices  = torch.linspace(0, self.num_frames[idx]-1,
+                                           self.num_frames[idx]//2).long()
+                features = features[indices]
+        elif self.tta_mode == 'speed_down':
+            if self.num_frames[idx] > 5:
+                indices  = torch.linspace(0, self.num_frames[idx]-1,
+                                           int(self.num_frames[idx]*1.5)).long()
+                indices  = indices.clamp(max=self.num_frames[idx]-1)
+                features = features[indices]
+
+        # Training augmentations (augment=True, tta_mode=None)
+        if self.augment and self.tta_mode is None:
+            num_frames = features.shape[0]
+            if num_frames > 8:
+                # Temporal crop: randomly keep 70–100% of frames
+                if random.random() < 0.5:
+                    ratio     = random.uniform(0.7, 1.0)
+                    new_len   = max(int(num_frames * ratio), 8)
+                    indices   = sorted(random.sample(range(num_frames), new_len))
+                    features  = features[indices]
+                # Temporal shift: roll frames ±3 positions
+                if random.random() < 0.3:
+                    shift    = random.randint(-3, 3)
+                    if shift != 0:
+                        features = torch.roll(features, shifts=shift, dims=0)
+                # Gaussian noise: σ = 0.01
+                if random.random() < 0.2:
+                    noise    = torch.randn_like(features) * 0.01
+                    features = features + noise
+
+        return features, torch.tensor(self.labels[idx], dtype=torch.long)
+```
+
+### Augmentation modes summary
+
+| Mode | When active | Effect |
+|------|-------------|--------|
+| `augment=True, tta_mode=None` | Training | Temporal crop, temporal shift, Gaussian noise |
+| `tta_mode='reverse'` | TTA inference | Reverses frame order |
+| `tta_mode='speed_up'` | TTA inference | Sub-samples to ~50% of frames |
+| `tta_mode='speed_down'` | TTA inference | Up-samples to ~150% of frames |
+| `augment=False, tta_mode=None` | Validation / Test | No augmentation |
+
+## `collate_features`
+
+Videos within a batch can have different lengths because temporal crop augmentation is stochastic. `collate_features` pads shorter sequences to the length of the longest sequence in the batch with zeros, and returns the true sequence lengths so the model can use packed sequences.
+
+```python
+def collate_features(batch):
+    features_list, labels_list, lengths = [], [], []
+
+    for features, label in batch:
+        features_list.append(features)
+        labels_list.append(label)
+        lengths.append(len(features))
+
+    max_len         = max(lengths)
+    feature_dim     = features_list[0].shape[1]
+    padded_features = torch.zeros(len(batch), max_len, feature_dim)
+
+    for i, features in enumerate(features_list):
+        padded_features[i, :len(features)] = features
+
+    labels  = torch.stack(labels_list)
+    lengths = torch.tensor(lengths)
+
+    return padded_features, labels, lengths
+```
+
+The three-element tuple `(padded_features, labels, lengths)` is the expected input format for `SuperEnhancedTemporalModel.forward()`.
+
+## Weighted sampling
+
+Category and subcategory sizes vary considerably. To prevent the model from over-fitting to the most frequent classes, `EnhancedPreExtractedFeaturesDataset` computes per-class weights and exposes them via `get_sample_weights()`:
+
+```python
+def _compute_class_weights(self):
+    num_classes    = len(self.class_counts)
+    total_samples  = len(self.labels)
+    weights = []
+    for class_id in range(num_classes):
+        if class_id in self.class_counts:
+            # Inverse-frequency weighting, clipped to [0.5, 10.0]
+            weight = total_samples / (num_classes * self.class_counts[class_id])
+            weight = min(max(weight, 0.5), 10.0)
+        else:
+            weight = 1.0
+        weights.append(weight)
+    return torch.FloatTensor(weights)
+```
+
+These weights are passed to `WeightedRandomSampler` during dataloader construction:
+
+```python
+sample_weights = train_dataset.get_sample_weights()
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(train_dataset),
+    replacement=True
+)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=48,
+    sampler=sampler,
+    collate_fn=collate_features,
+    ...
+)
+```
+
+<Warning>
+Do **not** pass `shuffle=True` together with `sampler`. PyTorch `DataLoader` will raise a `ValueError` — the two options are mutually exclusive.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Feature extraction" href="/training/feature-extraction">
+    Run CNN inference on the preprocessed tensors to produce HDF5 feature files.
+  </Card>
+  <Card title="Model training" href="/training/model-training">
+    Train the temporal model on the extracted features.
+  </Card>
+</CardGroup>

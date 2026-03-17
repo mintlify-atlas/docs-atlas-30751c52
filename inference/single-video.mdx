@@ -1,0 +1,318 @@
+---
+title: "Single-video inference"
+description: "Classify a single video using pre-extracted features or an external video file."
+---
+
+The inference pipeline supports two input modes: loading pre-extracted HDF5 features from the test dataset, or downloading and extracting features from an external video URL or local file path.
+
+## Inference modes
+
+<Columns cols={2}>
+  <Card title="Dataset videos" icon="database">
+    Load features directly from the pre-extracted `test_features*.h5` file. No GPU required for feature extraction — features are already computed.
+  </Card>
+  <Card title="External video" icon="video">
+    Pass a URL (YouTube, direct MP4) or a local file path. The pipeline downloads the video, extracts EfficientNet-B0 features, then runs classification.
+  </Card>
+</Columns>
+
+<Note>
+  The Flask web application (`app.py`) only supports dataset videos via the `/api/classify` endpoint. External video support is available through `test_already_extracted.py` in interactive CLI mode.
+</Note>
+
+## `SingleVideoFeatureLoader`
+
+Loads pre-extracted features for individual test-set videos from the HDF5 feature archive.
+
+### Constructor
+
+```python
+SingleVideoFeatureLoader(features_dir, processed_test_dir)
+```
+
+<ParamField path="features_dir" type="string" required>
+  Path to the directory containing `test_features*.h5`. Scans with a glob — the first matching file is used.
+</ParamField>
+
+<ParamField path="processed_test_dir" type="string" required>
+  Path to `data/processed/test`. Used to reconstruct the video-name-to-HDF5-index mapping by reading `processed_data.pt` files in category/subcategory order.
+</ParamField>
+
+On construction the loader:
+1. Globs `features_dir` for `test_features*.h5` and opens it.
+2. Reads the `category_mapping` attribute (`{"Animation": 0, "Flat_Content": 1, "Gaming": 2, "Natural_Content": 3}`).
+3. Walks `processed_test_dir` in sorted order to build a `video_name → (h5_index, label, category_name)` index.
+
+### `list_available_videos()`
+
+```python
+all_videos, videos_by_category = loader.list_available_videos()
+```
+
+Returns a flat list of all video names and a dict mapping each category name to a sorted list of video names within it.
+
+<ResponseField name="all_videos" type="list[str]">
+  Every video name in the test set, ordered by category (alphabetical) then by subcategory and filename.
+</ResponseField>
+
+<ResponseField name="videos_by_category" type="dict[str, list[str]]">
+  Keys are category names; values are sorted lists of video names belonging to each category.
+</ResponseField>
+
+### `load_video_features(video_name)`
+
+```python
+features, label, category_name = loader.load_video_features("video_filename.mp4")
+```
+
+Looks up the video name in the internal index and loads its features from the HDF5 file.
+
+<ParamField path="video_name" type="string" required>
+  Exact filename as it appears in the dataset (e.g., `"clip_001.mp4"`). Returns `(None, None, None)` if not found.
+</ParamField>
+
+<ResponseField name="features" type="torch.Tensor | None">
+  Float32 tensor of shape `[T, 1280]` where `T ≤ 73`. Only the actual frame count is returned (sliced by `num_frames` stored in HDF5).
+</ResponseField>
+
+<ResponseField name="label" type="int | None">
+  Integer class index.
+</ResponseField>
+
+<ResponseField name="category_name" type="str | None">
+  Human-readable category string, e.g. `"Gaming"`.
+</ResponseField>
+
+## `SingleVideoClassifier`
+
+Runs ensemble inference over one or more `SuperEnhancedTemporalModel` checkpoints.
+
+### Constructor
+
+```python
+SingleVideoClassifier(checkpoint_paths, device='cuda')
+```
+
+<ParamField path="checkpoint_paths" type="list[str]" required>
+  Ordered list of `.pt` checkpoint file paths. The four production checkpoints are:
+  `best_ensemble_model_1.pt`, `best_ensemble_model_2.pt`, `best_ensemble_model_3.pt`, `best_ensemble_model_4.pt`.
+</ParamField>
+
+<ParamField path="device" type="string" default="cuda">
+  Target device. If CUDA is unavailable, the classifier automatically falls back to `cpu` regardless of the value passed.
+</ParamField>
+
+<Warning>
+  `load_models()` must be called before any prediction method. The constructor only stores paths and resolves the device.
+</Warning>
+
+### `load_models()`
+
+```python
+classifier.load_models()
+```
+
+Iterates over `checkpoint_paths`, reads each checkpoint's `model_config` dict, and initialises a `SuperEnhancedTemporalModel` with those hyperparameters. All models share the same architecture:
+
+| Parameter | Value |
+|---|---|
+| `feature_dim` | 1280 |
+| `hidden_dim` | 768 |
+| `num_classes` | 4 |
+| `num_lstm_layers` | 4 |
+| `num_attention_heads` | 12 |
+| `dropout` | 0.4 |
+| `bidirectional` | `True` |
+
+`class_names` is fixed to `['Animation', 'Flat_Content', 'Gaming', 'Natural_Content']` after loading the first checkpoint.
+
+### `predict_standard(features)`
+
+Standard ensemble inference without any augmentation.
+
+```python
+probs = classifier.predict_standard(features)  # torch.Tensor [4]
+```
+
+Runs each loaded model on the feature tensor, applies softmax, then returns the mean probability vector across all models.
+
+<ResponseField name="probs" type="torch.Tensor">
+  Shape `[num_classes]`. Values are in `[0, 1]` and sum to 1.
+</ResponseField>
+
+### `predict_with_tta(features)`
+
+Ensemble inference with Test-Time Augmentation across four temporal variants.
+
+```python
+probs = classifier.predict_with_tta(features)  # torch.Tensor [4]
+```
+
+See [Ensemble and TTA](/inference/ensemble-tta) for a full breakdown of each augmentation mode.
+
+### `classify_video(features, true_label, video_name, use_tta)`
+
+High-level classification wrapper that prints a formatted result table and returns a structured dict.
+
+```python
+result = classifier.classify_video(
+    features=features,
+    true_label=0,          # optional — set to None for external videos
+    video_name="clip.mp4",
+    use_tta=False
+)
+```
+
+<ParamField path="features" type="torch.Tensor" required>
+  Feature tensor of shape `[T, 1280]`.
+</ParamField>
+
+<ParamField path="true_label" type="int | None">
+  Ground-truth class index. When provided, correctness is computed and printed. Pass `None` for unlabelled external videos.
+</ParamField>
+
+<ParamField path="video_name" type="string" default="Unknown">
+  Display name used in the result dict and printed output.
+</ParamField>
+
+<ParamField path="use_tta" type="boolean" default="False">
+  When `True`, calls `predict_with_tta()`; otherwise calls `predict_standard()`.
+</ParamField>
+
+#### Result dict
+
+<ResponseField name="video_name" type="string">
+  The value of the `video_name` argument.
+</ResponseField>
+
+<ResponseField name="true_class" type="string | None">
+  Class name for `true_label`, or `None`.
+</ResponseField>
+
+<ResponseField name="predicted_class" type="string">
+  Class name with the highest ensemble probability.
+</ResponseField>
+
+<ResponseField name="predicted_confidence" type="float">
+  Confidence of the top class expressed as a percentage (0–100).
+</ResponseField>
+
+<ResponseField name="is_correct" type="bool | None">
+  Whether `predicted_class == true_class`. `None` when no ground truth is provided.
+</ResponseField>
+
+<ResponseField name="all_scores" type="dict[str, float]">
+  Mapping of every class name to its confidence percentage.
+</ResponseField>
+
+<ResponseField name="timestamp" type="string">
+  ISO 8601 timestamp of the inference call.
+</ResponseField>
+
+<ResponseField name="tta_used" type="bool">
+  Whether TTA was enabled for this prediction.
+</ResponseField>
+
+<ResponseField name="ensemble_size" type="int">
+  Number of models that contributed to the prediction.
+</ResponseField>
+
+## External video support
+
+For videos outside the dataset, two helper functions handle download and feature extraction.
+
+### `download_video_if_needed(url_or_path)`
+
+```python
+local_path = download_video_if_needed("https://example.com/clip.mp4")
+```
+
+Returns a local file path. If `url_or_path` already points to an existing local file, it is returned unchanged. For URLs, the function tries `yt_dlp` first (supports YouTube and many platforms), then falls back to a direct HTTP download for plain MP4 links.
+
+### `extract_video_features(video_path, model_feature_dim, num_frames=73)`
+
+```python
+features = extract_video_features(local_path, model_feature_dim=1280, num_frames=73)
+# features: torch.Tensor [73, 1280]
+```
+
+<ParamField path="video_path" type="string" required>
+  Local path to the video file.
+</ParamField>
+
+<ParamField path="model_feature_dim" type="int" required>
+  Expected feature dimension. Must be `1280` for EfficientNet-B0 (which matches the trained models). A linear projection is applied automatically if dimensions differ.
+</ParamField>
+
+<ParamField path="num_frames" type="int" default="73">
+  Number of frames to sample uniformly across the video. Must match the value used during training.
+</ParamField>
+
+Internally uses a pretrained EfficientNet-B0 backbone (without the classifier head) and applies the standard ImageNet normalisation. Frames are resized to 256 × 256 and centre-cropped to 224 × 224 before passing through the backbone.
+
+<Tip>
+  Feature extraction runs on CPU by default. Pass the classifier's device to `extract_video_features(..., device=classifier.device)` to use GPU when available and speed up extraction for long videos.
+</Tip>
+
+## Complete usage example
+
+```python
+from pathlib import Path
+from test_already_extracted import (
+    SingleVideoFeatureLoader,
+    SingleVideoClassifier,
+    download_video_if_needed,
+    extract_video_features,
+)
+
+# --- Dataset video ---
+
+loader = SingleVideoFeatureLoader(
+    features_dir="features_enhanced/",
+    processed_test_dir="data/processed/test",
+)
+
+all_videos, by_category = loader.list_available_videos()
+print(f"Available: {len(all_videos)} videos across {list(by_category.keys())}")
+
+checkpoint_paths = [
+    "models_enhanced/best_ensemble_model_1.pt",
+    "models_enhanced/best_ensemble_model_2.pt",
+    "models_enhanced/best_ensemble_model_3.pt",
+    "models_enhanced/best_ensemble_model_4.pt",
+]
+
+clf = SingleVideoClassifier(checkpoint_paths=checkpoint_paths, device="cuda")
+clf.load_models()
+
+features, label, category = loader.load_video_features(all_videos[0])
+result = clf.classify_video(
+    features=features,
+    true_label=clf.class_names.index(category),
+    video_name=all_videos[0],
+    use_tta=True,
+)
+
+print(result["predicted_class"], f"{result['predicted_confidence']:.1f}%")
+
+# --- External video ---
+
+local_path = download_video_if_needed("https://example.com/sample.mp4")
+ext_features = extract_video_features(local_path, model_feature_dim=1280, num_frames=73)
+ext_result = clf.classify_video(
+    features=ext_features,
+    true_label=None,
+    video_name="sample.mp4",
+    use_tta=False,
+)
+print(ext_result["predicted_class"], f"{ext_result['predicted_confidence']:.1f}%")
+```
+
+<CardGroup cols={2}>
+  <Card title="Ensemble and TTA" icon="layer-group" href="/inference/ensemble-tta">
+    How multi-model ensemble and Test-Time Augmentation improve robustness.
+  </Card>
+  <Card title="Flask web application" icon="globe" href="/inference/flask-app">
+    Deploy the browser-based classification interface.
+  </Card>
+</CardGroup>
